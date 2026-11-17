@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.40
+// @version      9.42
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -107,6 +107,28 @@
              c.indexOf('Numpad') === 0 ? '小键盘' + c.slice(6) : c));
     }
 
+    /* v9.41：抖音自带的键盘快捷键（它自己的「键盘快捷键」面板里列的那套）。
+       我们绑键前先对一下，撞上了就提示 —— 两边同时触发比不给快捷键更烦人。 */
+    const DY_HOTKEYS = {
+        KeyZ: '赞/取消赞', KeyC: '收藏/取消收藏', KeyG: '关注/取消关注', KeyF: '进入作者主页',
+        KeyX: '评论', KeyV: '复制分享口令', KeyP: '推荐给朋友', KeyR: '不感兴趣',
+        KeyN: '相关推荐', KeyB: '开始/关闭弹幕', KeyJ: '清屏', KeyK: '自动连播',
+        KeyY: '网页内全屏', KeyH: '全屏', KeyL: '稍后在看', KeyU: '小窗模式',
+        Space: '暂停', ArrowUp: '上下翻页', ArrowDown: '上下翻页',
+        ArrowLeft: '快进快退', ArrowRight: '快进快退',
+        Equal: '音量加（Shift+=）', Minus: '音量减（Shift+-）'
+    };
+    /* 只有不带 Ctrl / Alt / Win 的组合才可能和抖音撞（它也认裸键 + Shift） */
+    function douyinConflict(spec) {
+        const h = parseHotkey(spec);
+        if (!h || h.ctrl || h.alt || h.meta) return '';
+        const name = DY_HOTKEYS[h.code];
+        if (!name) return '';
+        /* 音量那两档带 Shift，裸 = / - 反而不会触发；其余是裸键，带不带 Shift 都提示 */
+        if ((h.code === 'Equal' || h.code === 'Minus') && !h.shift) return '';
+        return name;
+    }
+
     function specFromEvent(e) {
         if (!ALLOWED_CODE.test(e.code || '')) return null;
         let s = '';
@@ -170,13 +192,22 @@
         hideSwitchBtn: true,
         hideDownloadApp: true,
         hideLivePopups: true,
-        hideGiftMsg: true,
-        hideLuckyBag: true,
-        /* v9.37.1：是否连抖音自己的「送礼信息 / 福袋口令」弹幕开关一起关掉。
-           默认关 —— 实测怀疑关掉这两个开关会连带影响直播间的福袋相关 UI
-           （抢福袋入口直接消失）。我们自己的 DOM 过滤已经能屏蔽这两类消息，
-           没必要再去动它的设置。 */
+        /* v9.41：聊天室里的「送礼信息 / 福袋口令」DOM 过滤整个下线 ——
+           实测抖音现在的聊天室行是虚拟列表（absolute 定位、行高 0），
+           藏不干净，用户也不在意那两条；要的是**弹幕层**关掉。
+           现在只保留下面这个开关（直接去关抖音弹幕设置里的那两项）。 */
         danmakuSwitchOff: false,
+        /* v9.41：界面清理（去按钮 / 去弹窗）。设置面板里独立一页，
+           以后这类开关全部往里加，不用在长列表里翻。 */
+        cleanAiDouyin: true,        // 播放器右侧「AI抖音」入口
+        cleanListenDouyin: true,    // 右侧工具栏「听抖音」
+        cleanTopClient: true,       // 顶部「客户端」下载入口
+        cleanDiamond: true,         // 顶部「充钻石」
+        cleanWallpaper: true,       // 顶部「壁纸」
+        /* 播放器右侧的两个浮层：点了收藏 / 分享才弹出来的那一大块。
+           按钮本身保留，只把弹出来的面板收掉。 */
+        cleanCollectPopup: true,    // 收藏弹窗（选收藏夹 / 新建收藏夹）
+        cleanSharePopup: true,      // 分享弹窗（分享给朋友 / 复制链接）
         hideGiftAudio: true,
         showViewerCount: true,
         wheelVolume: true,           // 画面内滚轮调音量（仅直播间）
@@ -216,6 +247,12 @@
         liquidLens: false,
         glassPress: true,
         settingsHotkey: 'Alt+KeyS',  // 设置面板快捷键（可自定义）
+        /* v9.41：倍速加 / 减。选中某个档位后每按一次跳一档，档位就是抖音自带的
+           0.75 ~ 3.0 那七档，比分档点选更顺手。 */
+        speedUpHotkey: 'Alt+Equal',          // 加速一档（默认 Alt + =）
+        speedDownHotkey: 'Alt+Minus',        // 减速一档（默认 Alt + -）
+        /* 注意：抖音自己的键位表里 Shift+= / Shift+- 是「音量加 / 音量减」，
+           所以这两个默认值刻意加了 Alt，别改回去。 */
         speedNormalHotkey: 'Shift+Digit1',   // 原倍速（1.0x）
         speedAltHotkey: 'Shift+Digit2',      // 切到「设定倍速」
         speedAlt: 2,                          // 设定倍速（0.75/1/1.25/1.5/1.75/2/3）
@@ -259,7 +296,8 @@
                 cfg[k] = (Number.isFinite(n) && n > 0 && n <= 0.2) ? n : defaultConfig.volumeStep;
             } else if (k === 'settingsHotkey') {
                 cfg[k] = parseHotkey(v) ? v : defaultConfig.settingsHotkey;
-            } else if (k === 'speedNormalHotkey' || k === 'speedAltHotkey') {
+            } else if (k === 'speedNormalHotkey' || k === 'speedAltHotkey' ||
+                       k === 'speedUpHotkey' || k === 'speedDownHotkey') {
                 cfg[k] = parseHotkey(v) ? v : defaultConfig[k];
             } else if (k === 'speedAlt') {
                 const n = Number(v);
@@ -474,6 +512,38 @@
             position: relative; background: #1b1b20; z-index: 10;
             border-radius: 14px 14px 0 0;
             display: flex; align-items: center; justify-content: space-between;
+        }
+        /* v9.42：标题与页签挪到滚动容器外面（固定不滚），
+           上面那条的负 margin 是给「标题在滚动容器里」准备的，这里必须覆盖掉，
+           否则标题会被负 margin 顶到面板外。放在它后面，同优先级后者生效。 */
+        #gm-settings-panel > h3 {
+            margin: 0; padding: 14px 16px 10px 16px;
+            border-radius: 14px 14px 0 0;
+            flex: 0 0 auto;
+        }
+        /* v9.42：顶部页签。常用/清理/快捷键/高级/诊断，一页只放相关内容，
+           主界面不再是一条几百项的流水账。 */
+        .gm-tabs {
+            display: flex; gap: 4px;
+            padding: 0 16px 10px;
+            flex: 0 0 auto;
+            border-bottom: 1px solid rgba(255,255,255,.10);
+        }
+        .gm-tab {
+            flex: 1 1 0; min-width: 0;
+            padding: 6px 2px; font-size: 12px; line-height: 1.2;
+            color: rgba(255,255,255,.62);
+            background: rgba(255,255,255,.06);
+            border: 1px solid transparent; border-radius: 8px;
+            cursor: pointer; font-family: inherit;
+            transition: background .16s ease, color .16s ease;
+            white-space: nowrap;
+        }
+        .gm-tab:hover { background: rgba(255,255,255,.12); color: rgba(255,255,255,.85); }
+        .gm-tab.active {
+            background: rgba(255,255,255,.20);
+            color: #fff; font-weight: 600;
+            border-color: rgba(255,255,255,.22);
         }
         #gm-settings-panel h3 small { font-weight: 400; color: #888; font-size: 11px; margin-left: 6px; }
         #gm-panel-close {
@@ -887,7 +957,16 @@
     let stableH = 0, stableFirst = 0, stableCount = 0;
 
     function isLivePage() {
-        return isLiveHost || !!document.querySelector('[id^="living_player_container"]');
+        if (isLiveHost) return true;
+        if (document.querySelector('[id^="living_player_container"]')) return true;
+        /* v9.41：www 里的内嵌直播间（/follow/live/xxx、搜索或推荐点开的直播）
+           根本没有 living_player_container，旧判定直接 false ——
+           于是真实人数整条链路一次都不跑（诊断里 poll:idle / cached:null /
+           lastPreciseAgo:never 就是这么来的），直播画质、弹幕开关同理。
+           这里按「路径」和「人数条」两条兜底。 */
+        if (/\/live\/\d{5,}/.test(location.pathname)) return true;
+        if (document.querySelector('[data-e2e="live-room-audience"]')) return true;
+        return false;
     }
 
     /* 浏览器原生全屏 / 抖音网页全屏（Y 键）时收起悬浮侧栏。
@@ -2476,7 +2555,7 @@
        一律不隐藏。上一版靠「是否弹窗（含 input / dialog 类名）」二次确认，
        但抢福袋浮层的容器类名本身就带 dialog / modal，于是照样被隐藏 ——
        这就是「福袋图标还是没回来」的原因。宁可不屏蔽一个福袋口令浮窗，
-       也不能把抢福袋入口干掉；聊天室里的福袋口令由 hideLuckyBag 单独过滤。 */
+       也不能把抢福袋入口干掉（聊天室那套「藏消息」的过滤 v9.41 已下线，现在只关弹幕）。 */
     function isLuckyProtected(el) {
         const t = el.textContent || '';
         if (t.indexOf('福袋') < 0) return false;
@@ -3142,7 +3221,8 @@
     }
     function applyDanmakuSettings() {
         if (!isLivePage() || danmakuBusy) return;
-        /* v9.37.1：默认不再去点抖音自己的那两个开关（见 defaultConfig.danmakuSwitchOff） */
+        /* v9.41：这里是**唯一**的弹幕屏蔽手段 —— 直接去点抖音弹幕设置里的
+           「送礼信息」「福袋口令」两个开关。默认不开，在「界面清理 → 特效与弹幕」里打开。 */
         if (!config.danmakuSwitchOff) return;
         if (location.href !== danmakuLastUrl) {
             danmakuLastUrl = location.href;
@@ -3150,8 +3230,12 @@
             danmakuAttempts = 0; danmakuCooldownUntil = 0; danmakuNote = 'idle';
             danmakuWeak.gift = 0; danmakuWeak.lucky = 0;
         }
-        const needGift = !!config.hideGiftMsg && !danmakuDone.gift;
-        const needLucky = !!config.hideLuckyBag && !danmakuDone.lucky;
+        /* v9.41：聊天室的 DOM 过滤下线后，这两项只看 danmakuSwitchOff 本身
+           （上面已经 early return 过了，走到这里就是要关这两个开关）。
+           以前它们依赖 hideGiftMsg / hideLuckyBag，那两个键删掉后会变成永远 false，
+           这个功能就整个失效了。 */
+        const needGift = !danmakuDone.gift;
+        const needLucky = !danmakuDone.lucky;
         if (!needGift && !needLucky) return;
         // 4 次就永久放弃太 aggressive：冷却 25s 后可继续，单房间最多 20 轮
         if (Date.now() < danmakuCooldownUntil || danmakuAttempts >= 20) return;
@@ -4627,6 +4711,7 @@
         roots: 0, textHits: 0, scanned: 0, hidden: 0, gift: 0, lucky: 0
     };
 
+    let chatRootNote = 'none';
     function findChatRoots() {
         const out = [];
         const all = document.querySelectorAll(CHAT_ROOT_SEL);
@@ -4638,35 +4723,80 @@
             if (r.width > window.innerWidth * 0.62) continue;
             out.push(el);
         }
-        // 兜底：右半屏里高度足够的可滚动容器（class 全变时仍能定位）
+        if (out.length) chatRootNote = 'selector';
+        const vw0 = window.innerWidth, vh0 = window.innerHeight;
+        /* v9.41 兜底 A：结构探测 —— 找「竖向列表容器」。
+           旧版这两条兜底都硬性要求「左边界落在右半屏」，直播间换成沉浸式布局后
+           聊天室不再贴右，于是一个都挑不出来（诊断里 roots:0、scanned:0，
+           功能整体空转）。现在只按尺寸与「可滚动 / 多子节点」筛，不再看左右。 */
         if (!out.length) {
-            const cand = document.querySelectorAll('div');
-            for (let i = 0; i < cand.length && i < 900; i++) {
-                const el = cand[i];
+            const cand = document.querySelectorAll('div[class], aside, section');
+            let guard0 = 0;
+            for (const el of cand) {
+                if (++guard0 > 4000) break;
                 let r;
                 try { r = el.getBoundingClientRect(); } catch (e) { continue; }
-                if (r.width < 200 || r.width > window.innerWidth * 0.5) continue;
-                if (r.height < window.innerHeight * 0.35) continue;
-                if (r.left < window.innerWidth * 0.5) continue;
-                if (el.querySelector(CHAT_ROOT_SEL)) continue;
+                if (r.width < 150 || r.width > vw0 * 0.55) continue;
+                if (r.height < vh0 * 0.22) continue;
+                if (r.top > vh0 * 0.6) continue;
+                const scrollable = el.scrollHeight > el.clientHeight + 20;
+                if (!scrollable && el.children.length < 3) continue;
+                if (el.querySelector('#gm-settings-panel')) continue;
                 out.push(el);
-                if (out.length >= 3) break;
+                if (out.length >= 6) break;
             }
+            if (out.length) chatRootNote = 'layout(A)';
         }
+        /* v9.41 兜底 B：文本反查。
+           诊断能扫到「赠送」「点亮粉丝团」这些文本节点（说明消息行确实在 DOM 里，
+           只是随机 class 全换过、行元素又是 absolute 定位），那就从命中文本往上
+           爬到第一个「有实际尺寸」的祖先，把它当聊天室根。 */
+        if (!out.length) {
+            const SHOW_TEXT0 = (window.NodeFilter && window.NodeFilter.SHOW_TEXT) || 4;
+            let w0 = null;
+            try { w0 = document.createTreeWalker(document.body, SHOW_TEXT0); } catch (e) { w0 = null; }
+            let node0, guard1 = 0;
+            while (w0 && (node0 = w0.nextNode()) && guard1++ < 40000 && out.length < 3) {
+                const t0 = (node0.nodeValue || '').trim();
+                if (!t0 || t0.length > 80) continue;
+                if (!GIFT_LINE_RE.test(t0) && !LUCKY_LINE_RE.test(t0) &&
+                    !/点亮粉丝团|加入粉丝团|送出了/.test(t0)) continue;
+                let cur = node0.parentElement, d0 = 0;
+                while (cur && cur !== document.body && d0++ < 12) {
+                    let r;
+                    try { r = cur.getBoundingClientRect(); } catch (e) { break; }
+                    if (r.width >= 150 && r.width <= vw0 * 0.6 &&
+                        r.height >= 120 && r.height <= vh0 * 0.95) {
+                        if (!out.some(o => o === cur || o.contains(cur))) out.push(cur);
+                        break;
+                    }
+                    cur = cur.parentElement;
+                }
+            }
+            if (out.length) chatRootNote = 'text(B)';
+        }
+        if (!out.length) chatRootNote = 'none';
         // 只留最外层，避免父子容器重复扫描
         return out.filter((el, i) =>
             !out.some((o, j) => j !== i && o !== el && o.contains(el))).slice(0, 4);
     }
 
     function smallestHideable(node, root) {
-        let el = node.parentElement, best = null;
-        for (let d = 0; el && el !== root && d < 5; d++, el = el.parentElement) {
+        let el = node.parentElement, best = null, fallback = null;
+        for (let d = 0; el && el !== root && d < 6; d++, el = el.parentElement) {
             let r;
             try { r = el.getBoundingClientRect(); } catch (e) { break; }
-            if (r.height < 8 || r.height > 120 || r.width < 60) break;
+            if (r.height > 140) break;                 // 已经超出单行范围，停
+            if (r.height < 8 || r.width < 60) {
+                /* v9.41：虚拟列表的行是 absolute 定位，内层常有 0 尺寸包装层。
+                   以前遇到这种层直接 break、整条消息放弃隐藏；现在只记一笔继续往上，
+                   真正有尺寸的那层仍然能被选中。 */
+                if (!fallback) fallback = el;
+                continue;
+            }
             best = el;
         }
-        return best;
+        return best || fallback;
     }
 
     function cachedChatRoots(force) {
@@ -4678,6 +4808,10 @@
         return chatRootCache.filter(el => el.isConnected);
     }
 
+    /* v9.41：**已下线，不再被任何任务调用**（LIVE_TASKS 里已移除）。
+       抖音现在的聊天室是虚拟列表（行元素 absolute、高度 0），DOM 藏不干净，
+       而且用户要的只是「弹幕层」关掉 —— 那由 danmakuSwitchOff 直接去点抖音自己的开关。
+       代码留着是因为下面的诊断还复用它的结构；两个开关键删掉后这里恒为 false。 */
     function filterLiveChat() {
         if ((!config.hideGiftMsg && !config.hideLuckyBag) || !isLivePage()) return;
         /* v9.19：聊天室没有新增消息/文本变化时直接跳过；6 秒一次全量兜底，
@@ -4766,8 +4900,7 @@
         push('# 抖音优化 · 消息过滤诊断');
         push('URL: ' + location.href);
         push('time: ' + new Date().toISOString());
-        push('config: hideGiftMsg=' + config.hideGiftMsg +
-             ' hideLuckyBag=' + config.hideLuckyBag +
+        push('config: danmakuSwitchOff=' + config.danmakuSwitchOff +
              ' hideLivePopups=' + config.hideLivePopups +
              ' hideEffects=' + config.hideEffects);
         push('stats: ' + JSON.stringify(chatFilterStats));
@@ -4888,7 +5021,7 @@
             }
         })();
         const roots = findChatRoots();
-        push('chat roots (' + roots.length + '):');
+        push('chat roots (' + roots.length + ') 来源=' + chatRootNote + ':');
         for (const r of roots) {
             const b = r.getBoundingClientRect();
             push('  ' + r.tagName.toLowerCase() + (r.id ? '#' + r.id : '') +
@@ -4896,6 +5029,35 @@
                  ' rect=' + [b.left | 0, b.top | 0, b.width | 0, b.height | 0].join(',') +
                  ' children=' + r.children.length);
         }
+        /* v9.41：根节点候选（不看左右半屏，只按尺寸与可滚动/多子节点筛），
+           以后 roots 又变成 0 时，直接从这几条里挑真身。 */
+        (function () {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const cands = [];
+            const list = document.querySelectorAll('div[class], aside, section');
+            let g = 0;
+            for (const el of list) {
+                if (++g > 4000 || cands.length >= 8) break;
+                if (el.closest && el.closest('#gm-settings-panel')) continue;
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+                if (r.width < 140 || r.width > vw * 0.6) continue;
+                if (r.height < vh * 0.2) continue;
+                const scr = el.scrollHeight > el.clientHeight + 20;
+                if (!scr && el.children.length < 3) continue;
+                cands.push(el);
+            }
+            push('root probe (' + cands.length + '):');
+            for (const el of cands) {
+                const b = el.getBoundingClientRect();
+                push('  ' + el.tagName.toLowerCase() +
+                     '.' + String(el.className || '').trim().split(/\s+/).slice(0, 3).join('.') +
+                     ' rect=' + [b.left | 0, b.top | 0, b.width | 0, b.height | 0].join(',') +
+                     ' kids=' + el.children.length +
+                     ' scroll=' + (el.scrollHeight > el.clientHeight + 20) +
+                     ' rows=' + el.querySelectorAll('div').length);
+            }
+        })();
         const kw = /送出了|送出|赠送|送给主播|福袋|口令|抽奖|去送礼|展馆|集星|点亮/;
         push('keyword text nodes (max 50):');
         const SHOW_TEXT = (window.NodeFilter && window.NodeFilter.SHOW_TEXT) || 4;
@@ -4946,6 +5108,12 @@
     const COUNT_WEAK_RE = /count|user|view|audience|online|watch|total|num|people/i;
     const COUNT_TEXT_RE = /display_value|display_long|user_count|total_user|room_view_stats|online_user|viewer_count|watch_count|audience|user_num|user_total|room_user|user_count_str/i;
     const COUNT_FIELD_RE = /"(display_value|display_long|user_count|total_user|online_user_count|viewer_count|watch_count|audience_count|room_user_count|real_count|online_count|visitor_count|view_count|user_num|user_total|room_view_stats)"\s*:\s*"?([0-9][0-9,]{0,12})"?/g;
+    /* v9.41：这些键虽然带 count 字样，但全是 AB 实验阈值 / 组件内部计数，
+       跟在线人数毫无关系。诊断里 `familiarRecommendEntranceCountLabelCondition: 1000`
+       就是被当成人数写上去的那个 —— 用户看到「人数固定在 1000」。
+       与其在打分阶段补救，不如在入口就丢掉。 */
+    const COUNT_NOISE_RE = /(?:^count$|countlabel|countlimit|count_threshold|threshold|prefetch|reconnect|retrycount|corecount|itemcount|channelcount|unbounddeps|defaultcount|cold_start|staticitem|slidingwindow|danmaku|survey|useredit|selecttab|abtest)/i;
+    const COUNT_STRONG_KEY_RE = /display_value|display_long|room_view_stats|user_count|total_user|online_user|viewer_count|watch_count|audience_count/i;
     const countHints = [];                 // 网络通道捕获到的候选（跨轮询保留）
     const countApis = new Map();           // 曾返回过人数字段的同源接口，供主动复取
     /* 人数越过旧量级时把参照区间跟着抬/降，避免 DOM 的「1万」把后续
@@ -4984,6 +5152,7 @@
         return null;
     }
     function pushHint(src, key, value) {
+        if (COUNT_NOISE_RE.test(key)) return;
         const n = toCount(value);
         if (n == null) return;
         const now = Date.now();
@@ -4995,6 +5164,7 @@
         if (countHints.length > 80) countHints.shift();
     }
     function pushHit(hits, src, key, value, strong) {
+        if (COUNT_NOISE_RE.test(key)) return;
         const n = toCount(value);
         if (n == null) return;
         hits.push({ src: src, key: key, value: n, strong: !!strong });
@@ -5002,6 +5172,20 @@
     /* v9.19：直播页的 JSON 响应很密集，旧版每个响应都 clone 一份再全文正则，
        内存与 CPU 都翻倍。这里加一个每秒 6 次的预算，超出直接跳过本轮扫描
        （fiber / DOM 两条通道仍在，不会断更）。 */
+    /* v9.41：进房那一波请求里，真正带人数的接口（/webcast/room/web/enter/ 之类）
+       往往和一堆埋点挤在同一秒，被每秒 6 次的预算挤掉就再也抓不到了。
+       这里给「像人数接口」的 URL 开个优先通道，不受预算限制。
+       同时把请求 URL 记进诊断，方便一眼看出人数到底走哪个接口。 */
+    const COUNT_PRIO_RE = /webcast|\/room\/|enter|stats|audience/i;
+    const reqLog = [];
+    function logReq(url) {
+        if (!url) return;
+        let u = String(url).split('#')[0];
+        if (u.length > 200) u = u.slice(0, 200);
+        if (reqLog.indexOf(u) >= 0) return;
+        reqLog.push(u);
+        if (reqLog.length > 60) reqLog.shift();
+    }
     let countScanWindow = 0, countScanCount = 0;
     function countScanBudget() {
         if (!config.showViewerCount) return false;
@@ -5049,9 +5233,12 @@
                                     if (/image|video|audio|font|octet-stream|protobuf|wasm/i.test(ct)) return;
                                     const len = get ? Number(get('content-length')) : 0;
                                     if (len > 2000000) return;
-                                    if (!countScanBudget()) return;
+                                    const scanUrl = String(res.url || reqUrl || '');
+                                    logReq(scanUrl);
+                                    if (!config.showViewerCount) return;
+                                    if (!COUNT_PRIO_RE.test(scanUrl) && !countScanBudget()) return;
                                     res.clone().text().then(function (t) {
-                                        scanJsonForCount(t, 'fetch', null, res.url || reqUrl);
+                                        scanJsonForCount(t, 'fetch', null, scanUrl);
                                     }).catch(function () {});
                                 } catch (e) {}
                             }).catch(function () {});
@@ -5068,7 +5255,10 @@
             if (XP && !XP.__dyCountHooked) {
                 const nativeAdd = XP.addEventListener, nativeSend = XP.send, nativeOpen = XP.open;
                 if (nativeOpen) XP.open = function (method, url) {
-                    try { this.__dyUrl = String(url || ''); } catch (e) {}
+                    try {
+                        this.__dyUrl = String(url || '');
+                        logReq(this.__dyUrl);
+                    } catch (e) {}
                     return nativeOpen.apply(this, arguments);
                 };
                 XP.send = function () {
@@ -5076,8 +5266,10 @@
                     try {
                         if (nativeAdd) nativeAdd.call(this, 'load', function () {
                             try {
-                                if (!countScanBudget()) return;
-                                scanJsonForCount(self.responseText, 'xhr', null, self.__dyUrl);
+                                if (!config.showViewerCount) return;
+                                const u = String(self.__dyUrl || '');
+                                if (!COUNT_PRIO_RE.test(u) && !countScanBudget()) return;
+                                scanJsonForCount(self.responseText, 'xhr', null, u);
                             } catch (e) {}
                         });
                     } catch (e) {}
@@ -5091,11 +5283,50 @@
 
     /* WebSocket 只接文本 / JSON 消息，不猜二进制 protobuf，
        避免把随机字节当成人数显示出来。 */
+    /* v9.41：诊断用统计。抖音直播的人数推送走 protobuf 二进制，
+       旧的 scanWsMessage 只认字符串/Blob，二进制直接丢掉 —— 于是
+       「网络通道 0 条」看着像是没收到消息，其实收到了只是没解。
+       这里只做计数和留样（把前几条含「万/观看/人数」的消息解成可读文本），
+       不猜结构、不产出数字；前 200 条之后只计数，避免拖慢直播页。 */
+    const wsStats = { text: 0, bin: 0, jsonHits: 0, samples: [], hex: [] };
+    function hexHead(buf, n) {
+        let out = '';
+        try {
+            const u = new Uint8Array(buf, 0, Math.min(n, buf.byteLength));
+            for (let i = 0; i < u.length; i++)
+                out += (u[i] < 16 ? '0' : '') + u[i].toString(16) + ' ';
+        } catch (e) { out = '?'; }
+        return out.trim();
+    }
     function scanWsMessage(data) {
         if (!data) return;
-        if (typeof data === 'string') scanJsonForCount(data, 'ws', null);
-        else if (typeof Blob !== 'undefined' && data instanceof Blob && data.size < 300000) {
+        if (typeof data === 'string') {
+            wsStats.text++;
+            if (COUNT_TEXT_RE.test(data)) wsStats.jsonHits++;
+            scanJsonForCount(data, 'ws', null);
+            return;
+        }
+        if (typeof Blob !== 'undefined' && data instanceof Blob && data.size < 300000) {
+            wsStats.bin++;
             try { data.text().then(t => scanJsonForCount(t, 'ws', null)).catch(() => {}); } catch (e) {}
+            return;
+        }
+        if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+            wsStats.bin++;
+            if (wsStats.bin <= 200 && data.byteLength && data.byteLength < 400000) {
+                /* 留地条 hex：一眼看出是 protobuf（开头 0x08/0x0a 之类）还是
+                   已经被 gzip（1f 8b）、要不要解压。只取前 24 字节，几乎零开销。 */
+                if (wsStats.hex.length < 4 && data.byteLength >= 8) {
+                    wsStats.hex.push(data.byteLength + 'B ' + hexHead(data, 24));
+                }
+                try {
+                    const txt = new TextDecoder('utf-8').decode(new Uint8Array(data));
+                    if (wsStats.samples.length < 6 && /万|观看|人数|在线/.test(txt)) {
+                        wsStats.samples.push(data.byteLength + 'B :: ' +
+                            txt.replace(/[^\x20-\x7e\u4e00-\u9fa5]+/g, '·').slice(0, 220));
+                    }
+                } catch (e) {}
+            }
         }
     }
     function installWebSocketHook() {
@@ -5404,6 +5635,10 @@
             (score(b) - score(a)) || ((b.at || 0) - (a.at || 0)) || (b.value - a.value));
         if (!sorted.length) return null;
         const best = sorted[0];
+        /* v9.41：页面还没显示模糊值（scale 为空）时没有任何参照，
+           这时只认字段名明确的候选 —— 否则 AB 阈值、组件计数会被当成人数，
+           显示出来就是「固定 1000」这种明显不对的数字。 */
+        if (!scale && !COUNT_STRONG_KEY_RE.test(best.key)) return null;
         if (scale && !(best.value >= scale[0] && best.value <= scale[1])) {
             // 最近上报的明确字段允许突破旧量级（页面「1万」这类模糊值会滞后），
             // 避免人数增长后被旧量级判死、显示永久停在旧数字。
@@ -5414,6 +5649,44 @@
         if (best.fresh && /display_value|display_long|room_view_stats|user_count|total_user/.test(best.key))
             widenScale(best.value);
         return best.value;
+    }
+
+    /* v9.41：人数来源探查 —— 精确值到底藏在哪。
+       人数条元素的 fiber 链逐层打印「组件名 + props/state 顶层键名」，
+       真有一份 roomStore 挂着，扫一遍就能看见它在第几层。 */
+    function fiberProbe(el) {
+        const out = [];
+        let f = null;
+        try { f = dyReactFiber(el); } catch (e) { f = null; }
+        let d = 0;
+        while (f && d++ < 18) {
+            const t = f.type;
+            let name;
+            if (typeof t === 'string') name = t;
+            else if (typeof t === 'function') name = t.displayName || t.name || 'fn';
+            else if (t && t.displayName) name = t.displayName;
+            else name = 'tag' + f.tag;
+            const bits = [];
+            try {
+                const mp = f.memoizedProps;
+                if (mp && typeof mp === 'object') {
+                    const ks = Object.keys(mp).slice(0, 12);
+                    if (ks.length) bits.push('p[' + ks.join(',') + ']');
+                }
+            } catch (e) {}
+            try {
+                const ms = f.memoizedState;
+                if (ms && typeof ms === 'object') {
+                    const ks = Object.keys(ms).filter(k =>
+                        k !== 'next' && k !== 'baseState' && k !== 'baseQueue' &&
+                        k !== 'queue' && k !== 'memoizedState' && k !== 'deps').slice(0, 12);
+                    if (ks.length) bits.push('s[' + ks.join(',') + ']');
+                }
+            } catch (e) {}
+            out.push(d + '. ' + name + (bits.length ? '  ' + bits.join(' ') : ''));
+            f = f.return;
+        }
+        return out;
     }
 
     /* 排障：一次导出所有候选值、数据源、script 片段、全局对象名。 */
@@ -5458,6 +5731,20 @@
                 .filter(x => /store|state|data|room|initial|render|pace|webcast|live|app|global|__/i.test(x))
                 .slice(0, 100);
         } catch (e) {}
+        push('page: isLivePage=' + isLivePage() + ' isLiveHost=' + isLiveHost +
+             ' path=' + location.pathname);
+        push('ws: text=' + wsStats.text + ' bin=' + wsStats.bin +
+             ' jsonHits=' + wsStats.jsonHits);
+        push('requests (' + reqLog.length + '):');
+        for (const u of reqLog.slice(-40)) push('  ' + u);
+        for (const sp of wsStats.samples) push('  ws sample: ' + sp);
+        for (const hx of wsStats.hex) push('  ws hex: ' + hx);
+        push('fiber chain (从人数条往上):');
+        try {
+            const chain = el ? fiberProbe(el) : [];
+            if (!chain.length) push('  (没有锚点或拿不到 fiber)');
+            else for (const l of chain) push('  ' + l);
+        } catch (e) { push('  (探测失败 ' + e + ')'); }
         push('global names: ' + globals.join(', '));
         push('chat filter: ' + JSON.stringify(chatFilterStats));
         const text = lines.join('\n');
@@ -6911,6 +7198,29 @@
         if (fromKey) showTip(rate === 1 ? '原速 1.0x' : '倍速 ' + fmtSpeed(rate), 1100);
         return true;
     }
+    /* v9.41：倍速加 / 减一档。以「当前实际速率」为基准找最近的一档再跳，
+       这样不管当前是脚本设的还是抖音自己的倍速栏设的，加减都接得上。 */
+    function stepSpeed(dir) {
+        const v = findActiveVideo();
+        if (!v) { showTip('没找到正在播放的视频', 1400); return; }
+        if (!speedSupported(v)) { showTip('直播流不支持改倍速', 1600); return; }
+        const cur = Number(v.playbackRate) || 1;
+        let idx = 0, best = Infinity;
+        for (let i = 0; i < SPEED_STEPS.length; i++) {
+            const d = Math.abs(SPEED_STEPS[i] - cur);
+            if (d < best) { best = d; idx = i; }
+        }
+        let next = idx + (dir > 0 ? 1 : -1);
+        if (next < 0) next = 0;
+        if (next > SPEED_STEPS.length - 1) next = SPEED_STEPS.length - 1;
+        if (next === idx) {
+            showTip(dir > 0
+                ? '已经是最快 ' + fmtSpeed(SPEED_STEPS[idx])
+                : '已经是最慢 ' + fmtSpeed(SPEED_STEPS[idx]), 1200);
+            return;
+        }
+        applySpeed(SPEED_STEPS[next], true);
+    }
     /* 抖音换集 / 换视频会把速率重置，这里每轮补一次（只在偏差时才写，免得打架） */
     function keepPlaybackRate() {
         if (speedWanted === 1) return;
@@ -8356,6 +8666,10 @@
             Math.round(((Number(video.volume) || 0) + dir * step) * 1000) / 1000));
         // 已经到顶/到底：不再重复写，避免滚动时白白触发 volumechange
         if (Math.abs(target - video.volume) < 0.0005) return;
+        /* v9.42：滚轮也是「用户自己在调音量」。先刷新 lastUserInputAt，
+           下面派发的 volumechange 才会被判定成手动静音并让防静音守护收手；
+           旧版这里不刷新，滚到 0 立刻被守护顶回 50%。 */
+        lastUserInputAt = Date.now();
         volumeGuard = { video: video, value: target, until: Date.now() + 200 };
         video.volume = target;
         try { video.dispatchEvent(new Event('volumechange', { bubbles: true })); } catch (e) {}
@@ -8608,12 +8922,22 @@
         }
         return best;
     }
+    /* v9.42：只在「真的被静音了」（muted=true）时才解除并补音量，而且补的是
+       用户最后用过的音量，不再写死 0.5。
+       旧版是 `if (!v.volume) v.volume = 0.5` —— 用户把滚轮滚到 0% 时，
+       volumechange 会触发守护，200ms 后这里就把 0 顶成 50%，
+       表现就是「调到 0% 立刻变 50%，点一下画面又正常」（点击让
+       lastUserInputAt 刷新，守护才肯停手）。 */
+    let lastGoodVolume = 0.5;
     function unmuteLiveVideo() {
         const v = mainLiveVideo();
         if (!v) return false;
         try {
-            if (v.muted) v.muted = false;
-            if (!v.volume) v.volume = 0.5;
+            if (v.volume > 0.01) lastGoodVolume = v.volume;
+            if (v.muted) {
+                v.muted = false;
+                if (!v.volume) v.volume = lastGoodVolume;
+            }
             return !v.muted;
         } catch (e) { return false; }
     }
@@ -8746,6 +9070,247 @@
 
     /* v9.19：按页面类型分组。旧版 20 个任务每轮全跑，live 页也要进一遍
        www 专属任务的函数体再早退；分组后两边只跑自己的。 */
+    /* =====================================================================
+     * v9.41 界面清理：去掉某些按钮 / 入口
+     * =====================================================================
+     * 两类规则，原因不同：
+     *   css  —— 有稳定标识（独立 class / data-e2e / href 片段），直接注入样式；
+     *   text —— 只能靠文案定位。抖音顶栏那几个按钮共用哈希 class，还都套着
+     *           data-e2e="something-button"（命中 5 个），光看选择器会误伤一片，
+     *           所以按「文案 + 区域（顶栏 / 右侧栏）」找元素，再往上找到只含
+     *           这段文字、尺寸像按钮的那一层隐藏。
+     * 文案规则用一次遍历同时处理所有规则，最多扫 6000 个节点，2.5 秒一轮。 */
+    const CLEAN_CSS_RULES = [
+        ['cleanAiDouyin', '[class*="ai-douyin-entry"], .ai-douyin-entry'],
+        ['cleanTopClient', 'a[href*="/download/pc"], a[href*="/downloadpage/pc"]'],
+        ['cleanWallpaper', 'div.ZLiWmE4n'],
+        /* 听抖音：它在右侧竖排工具栏里，和点赞/评论/收藏/分享同一列。
+           刻意只用 class 定位、不用文案 —— 聊天室里单独一条「听抖音」的弹幕
+           也会被文案规则误伤，而右侧那一列和聊天区在 x 轴上是重叠的。 */
+        ['cleanListenDouyin', '.X8FkYUpY.dR9rKVUF'],
+        /* 收藏弹窗：探查报告里它的容器是 div.semi-always-dark._KRDPUZX
+           （_KRDPUZX 是收藏那一份的专属哈希），CSS 直接压掉不会闪。 */
+        ['cleanCollectPopup', 'div.semi-always-dark._KRDPUZX'],
+        /* 分享弹窗：容器带 `recommend-login-panel`（实测 315x492，另有一串随机哈希）。
+           这里也必须走 CSS —— 只靠 JS 判定的话，弹窗先被画出来才轮到我们处理，
+           于是「闪一下」。CSS 是元素一插入就生效，跟收藏弹窗一个待遇。
+           JS 那条（文案认人）保留着，万一哪天这个 class 换了名字还能兜住。 */
+        ['cleanSharePopup', '[class*="recommend-login-panel"]']
+    ];
+    /* 文案规则只用于「顶栏」（y < 80px）—— 聊天室、评论都在下面，不会误伤 */
+    const CLEAN_TEXT_RULES = [
+        ['cleanDiamond', '充钻石', 'top'],
+        ['cleanWallpaper', '壁纸', 'top'],
+        ['cleanTopClient', '客户端', 'top']
+    ];
+    let cleanTextAt = 0;
+
+    function applyCleanStyle() {
+        let css = '';
+        for (const [key, sel] of CLEAN_CSS_RULES) {
+            if (config[key]) css += sel + ' { display: none !important; }\n';
+        }
+        let st = document.getElementById('gm-clean-style');
+        if (!st) {
+            st = document.createElement('style');
+            st.id = 'gm-clean-style';
+            (document.head || document.documentElement).appendChild(st);
+        }
+        if (st.textContent !== css) st.textContent = css;
+    }
+
+    function applyCleanText() {
+        if (Date.now() - cleanTextAt < 2500) return;
+        const rules = CLEAN_TEXT_RULES.filter(r => config[r[0]]);
+        if (!rules.length) return;
+        cleanTextAt = Date.now();
+        const want = new Map();
+        for (const [key, text, area] of rules) want.set(text, { key: key, area: area });
+        const vw = window.innerWidth;
+        let guard = 0;
+        for (const el of document.querySelectorAll('p, span, div, a')) {
+            if (++guard > 6000) break;
+            if (el.children.length > 2) continue;
+            if (el.closest && el.closest('#gm-settings-panel')) continue;
+            const t = (el.textContent || '').trim();
+            const hit = want.get(t);
+            if (!hit) continue;
+            let r;
+            try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+            if (!r || r.width < 8 || r.height < 8) continue;
+            /* 区域过滤：顶栏 = 贴着窗口顶；右侧工具栏 = 靠右竖排 */
+            if (hit.area === 'top' && r.top > 80) continue;
+            if (hit.area === 'right' && r.left < vw * 0.65) continue;
+            /* 往上找到「只包含这段文字、尺寸像按钮」的最高那层再隐藏 */
+            let best = el, cur = el.parentElement, d = 0;
+            while (cur && cur !== document.body && d++ < 4) {
+                if ((cur.textContent || '').trim() !== t) break;
+                let cr;
+                try { cr = cur.getBoundingClientRect(); } catch (e) { break; }
+                if (!cr || cr.height > 78 || cr.width > 220) break;
+                best = cur; cur = cur.parentElement;
+            }
+            if (best.getAttribute('data-gm-clean') === hit.key) continue;
+            best.setAttribute('data-gm-clean', hit.key);
+            best.style.setProperty('display', 'none', 'important');
+        }
+    }
+
+    /* v9.41：播放器右侧的收藏 / 分享浮层。
+       两份弹窗都套在 semi 设计系统的 `semi-always-dark` 里（哈希不同），
+       所以容器按 class 前缀找，再用弹窗自己的文案区分是谁：
+         含「收藏夹」            → 收藏弹窗
+         含「分享给朋友 / 复制链接」→ 分享弹窗
+       只隐藏浮层本身，右侧工具栏上的收藏 / 分享按钮原样保留。
+       通过 MutationObserver 触发（弹窗是点出来才插入的），节流 150ms。 */
+    /* v9.41：收藏弹窗在 semi 那套里（`.semi-always-dark._KRDPUZX`），
+       分享弹窗不在 —— 它的容器 class 带 `recommend-login-panel`
+       （实测 315x492：顶部「分享给朋友」+ 会话列表 + 底部按钮行）。
+       两族都收；命中后再往上扩到「装得下整个弹窗」的那层，
+       否则只藏到列表那一截，底部按钮行还留着。 */
+    const POPUP_BOX_SEL = '.semi-always-dark, [class*="semi-always-dark"], ' +
+        '[class*="recommend-login-panel"], [class*="share-panel"], [class*="SharePanel"]';
+    let cleanPopupAt = 0, cleanPopupObserver = null;
+
+    /* v9.41：弹窗「闪一下」的解法。
+       弹窗是点出来才插入 DOM 的，等下一轮定时任务（1.5 秒）再处理必然看得见。
+       现在 MutationObserver 一认出候选节点就**先把它设成 visibility:hidden**
+       （这一拍量不到尺寸也没关系，反正已经画不出来了），
+       紧接着同步做一次精确判定：确实是收藏 / 分享弹窗就 display:none，
+       不是的话 700ms 后把 visibility 还回去。 */
+    function pendingHidePopup(roots) {
+        for (const root of roots) {
+            if (!root || root.nodeType !== 1) continue;
+            let list = [];
+            try {
+                if (root.matches && root.matches(POPUP_BOX_SEL)) list.push(root);
+                if (root.querySelectorAll) {
+                    root.querySelectorAll(POPUP_BOX_SEL).forEach(x => list.push(x));
+                }
+            } catch (e) { continue; }
+            for (const el of list) {
+                if (el.closest && el.closest('#gm-settings-panel')) continue;
+                if (el.hasAttribute('data-gm-popup-pending')) continue;
+                el.setAttribute('data-gm-popup-pending', String(Date.now()));
+                el.style.setProperty('visibility', 'hidden', 'important');
+            }
+        }
+    }
+    function settlePendingPopup() {
+        const pend = document.querySelectorAll('[data-gm-popup-pending]');
+        const now = Date.now();
+        for (const el of pend) {
+            const at = Number(el.getAttribute('data-gm-popup-pending')) || 0;
+            if (now - at < 700) continue;
+            el.removeAttribute('data-gm-popup-pending');
+            /* display:none 的不用管；判定失败的把 visibility 还回去 */
+            if (el.style.visibility === 'hidden' && el.style.display !== 'none') {
+                el.style.removeProperty('visibility');
+            }
+        }
+    }
+
+    function expandPopupBox(el) {
+        let box = el;
+        for (let i = 0; i < 4; i++) {
+            const p = box.parentElement;
+            if (!p || p === document.body) break;
+            let pr;
+            try { pr = p.getBoundingClientRect(); } catch (e) { break; }
+            if (pr.width < 200 || pr.width > 720) break;
+            if (pr.height < 100 || pr.height > 820) break;
+            if (pr.left < window.innerWidth * 0.4) break;
+            /* 父层文本量暴涨 = 已经扩到整页容器了，停手 */
+            const a = (box.textContent || '').length;
+            const b = (p.textContent || '').length;
+            if (b > a * 1.5 + 60) break;
+            box = p;
+        }
+        return box;
+    }
+    function applyCleanPopup() {
+        /* 先结算 pending：两个开关都关掉时这个函数会提前 return，
+           放在末尾就永远清不到，被 pending 按住（visibility:hidden）的元素会一直隐形。 */
+        settlePendingPopup();
+        const needC = !!config.cleanCollectPopup;
+        const needS = !!config.cleanSharePopup;
+        /* 开关关掉后要把之前隐藏的恢复回去 */
+        const marked = document.querySelectorAll('[data-gm-cleanpopup]');
+        for (const el of marked) {
+            const k = el.getAttribute('data-gm-cleanpopup');
+            if ((k === 'collect' && !needC) || (k === 'share' && !needS)) {
+                el.removeAttribute('data-gm-cleanpopup');
+                el.removeAttribute('data-gm-popup-pending');
+                el.style.removeProperty('display');
+                el.style.removeProperty('visibility');
+            }
+        }
+        if (!needC && !needS) return;
+        const vw = window.innerWidth;
+        const boxes = document.querySelectorAll(POPUP_BOX_SEL);
+        for (const el0 of boxes) {
+            if (el0.closest && el0.closest('#gm-settings-panel')) continue;
+            let r0;
+            try { r0 = el0.getBoundingClientRect(); } catch (e) { continue; }
+            /* 太小的先放过（按钮、tooltip 之类），弹窗本体 300x250 起 */
+            if (r0.width < 200 || r0.height < 100) continue;
+            if (r0.left < vw * 0.4) continue;
+            const el = expandPopupBox(el0);
+            if (el.closest && el.closest('#gm-settings-panel')) continue;
+            let r;
+            try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+            if (r.width < 200 || r.width > 700 || r.height < 100 || r.height > 800) continue;
+            if (r.left < vw * 0.4) continue;         // 播放器右侧那一列
+            const t = (el.textContent || '').slice(0, 600);
+            let kind = '';
+            /* 先认分享（特征更具体），再认收藏 */
+            if (/分享给朋友|复制链接|分享到|生成图片/.test(t)) kind = 'share';
+            else if (/选择收藏夹|暂无收藏夹|新建收藏夹|收藏夹/.test(t)) kind = 'collect';
+            if (!kind) continue;
+            if (kind === 'collect' && !needC) continue;
+            if (kind === 'share' && !needS) continue;
+            if (el.getAttribute('data-gm-cleanpopup') === kind) continue;
+            el.setAttribute('data-gm-cleanpopup', kind);
+            el.style.setProperty('display', 'none', 'important');
+            el.removeAttribute('data-gm-popup-pending');
+        }
+    }
+    function ensureCleanPopupObserver() {
+        if (cleanPopupObserver || !document.body) return;
+        if (!config.cleanCollectPopup && !config.cleanSharePopup) return;
+        cleanPopupObserver = new MutationObserver((records) => {
+            /* 只认「新增节点里出现弹窗候选」这一种变化：抖音每帧都在改 DOM，
+               无条件全量查一遍太浪费。不节流 —— 回调跑在微任务里、下一帧渲染之前，
+               所以能赶在弹窗画出来之前把它按住。 */
+            const hit = [];
+            for (const rec of records) {
+                const nodes = rec.addedNodes;
+                for (let i = 0; i < nodes.length; i++) {
+                    const n = nodes[i];
+                    if (!n || n.nodeType !== 1) continue;
+                    let ok = false;
+                    try {
+                        ok = (n.matches && n.matches(POPUP_BOX_SEL)) ||
+                             (n.children && n.children.length && n.querySelector &&
+                              !!n.querySelector(POPUP_BOX_SEL));
+                    } catch (e) { ok = false; }
+                    if (ok) hit.push(n);
+                }
+                if (hit.length > 3) break;
+            }
+            if (!hit.length) return;
+            try { pendingHidePopup(hit); } catch (e) {}
+            cleanPopupAt = Date.now();
+            try { applyCleanPopup(); } catch (e) {}
+            /* 有些弹窗这一拍还量不到尺寸（入场动画 / 布局未完成），
+               120ms 后补一次，那时还没判定成功也不会再闪（一直是 hidden）。 */
+            setTimeout(() => { try { applyCleanPopup(); } catch (e) {} }, 120);
+        });
+        try {
+            cleanPopupObserver.observe(document.body, { childList: true, subtree: true });
+        } catch (e) { cleanPopupObserver = null; }
+    }
+
     const COMMON_TASKS = [
         ensureObserver,
         refreshSidebarRoot,
@@ -8755,7 +9320,9 @@
         syncSidebarHostState,
         checkUrlChange,
         liftSidebarOverlays,
-        closePausePopupTask
+        closePausePopupTask,
+        applyCleanText,
+        applyCleanPopup
     ];
     const WWW_TASKS = [
         applyVideoMaxQuality,
@@ -8772,7 +9339,6 @@
         keepPlaybackRate,          // 直播流自己会跳过（duration=Infinity）
         guardResumeAudio,
         hideLivePopupsTask,
-        filterLiveChat,
         updateViewerCount,
         pollViewerCount,
         muteGiftAudios
@@ -8836,6 +9402,15 @@
             const normal = specMatches(e, config.speedNormalHotkey);
             e.preventDefault(); e.stopImmediatePropagation();
             safeRun(() => applySpeed(normal ? 1 : config.speedAlt, true));
+            return;
+        }
+        /* v9.41：倍速加 / 减一档（默认 Shift + = / Shift + -） */
+        if (specMatches(e, config.speedUpHotkey) || specMatches(e, config.speedDownHotkey)) {
+            const ae = document.activeElement;
+            if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+            const up = specMatches(e, config.speedUpHotkey);
+            e.preventDefault(); e.stopImmediatePropagation();
+            safeRun(() => stepSpeed(up ? 1 : -1));
         }
     }, true);
 
@@ -8863,9 +9438,14 @@
         ['hideSwitchBtn',     '屏蔽切换播放↑↓按钮'],
         ['hideDownloadApp',   '屏蔽下载抖音精选'],
         ['hideLivePopups',    '屏蔽悬浮弹窗(展馆/送礼)'],
-        ['hideGiftMsg',       '屏蔽送礼信息(精准)'],
-        ['hideLuckyBag',      '屏蔽福袋口令(精准)'],
-        ['danmakuSwitchOff',  '同时关抖音自带弹幕开关(可能隐藏福袋入口)'],
+        ['danmakuSwitchOff',  '关掉福袋口令与送礼信息弹幕'],
+        ['cleanAiDouyin',     '去掉「AI抖音」入口'],
+        ['cleanListenDouyin', '去掉「听抖音」'],
+        ['cleanTopClient',    '去掉顶部「客户端」'],
+        ['cleanDiamond',      '去掉顶部「充钻石」'],
+        ['cleanWallpaper',    '去掉顶部「壁纸」'],
+        ['cleanCollectPopup', '去掉收藏弹窗'],
+        ['cleanSharePopup',   '去掉分享弹窗'],
         ['hideGiftAudio',     '静默拦截礼物声音'],
         ['showViewerCount',   '显示真实在线人数'],
         ['highlightSearch',   '评论区可搜索词高亮'],
@@ -9119,7 +9699,9 @@
             hotkeyInput.classList.remove('capturing');
         }
         for (const [sel, key] of [['#gm-hk-speed-normal', 'speedNormalHotkey'],
-                                  ['#gm-hk-speed-alt', 'speedAltHotkey']]) {
+                                  ['#gm-hk-speed-alt', 'speedAltHotkey'],
+                                  ['#gm-hk-speed-up', 'speedUpHotkey'],
+                                  ['#gm-hk-speed-down', 'speedDownHotkey']]) {
             const el = settingsPanel.querySelector(sel);
             if (!el) continue;
             if (hotkeyCapturing && hotkeyInput === el) continue;
@@ -9130,7 +9712,8 @@
         if (hint) hint.textContent = hotkeyLabel(config.settingsHotkey) +
             ' 打开/关闭 · ' + hotkeyLabel(config.speedNormalHotkey) + ' 原速 · ' +
             hotkeyLabel(config.speedAltHotkey) + ' ' + fmtSpeed(config.speedAlt) +
-            ' · Esc 或点击面板外关闭';
+            ' · ' + hotkeyLabel(config.speedUpHotkey) + '/' +
+            hotkeyLabel(config.speedDownHotkey) + ' 加减速 · Esc 或点击面板外关闭';
     }
 
     function createSettingsUI() {
@@ -9178,141 +9761,206 @@
                 ).join('')}
             </select>`;
 
-        panel.innerHTML = `<div class="gm-panel-scroll">
-            <h3><span>抖音网页版个人优化 <small>v9.40</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
-            <div class="gm-hint" id="gm-hint"></div>
-
-            ${sec('通用')}
-            <div class="gm-setting-row">
-                <span>设置面板快捷键</span>
-                <input type="text" id="gm-hotkey-input" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+        panel.innerHTML = `
+            <h3><span>抖音网页版个人优化 <small>v9.42</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <div class="gm-tabs" id="gm-tabs">
+                <button type="button" class="gm-tab active" data-tab="main">常用</button>
+                <button type="button" class="gm-tab" data-tab="clean">清理</button>
+                <button type="button" class="gm-tab" data-tab="keys">快捷键</button>
+                <button type="button" class="gm-tab" data-tab="adv">高级</button>
+                <button type="button" class="gm-tab" data-tab="diag">诊断</button>
             </div>
+            <div class="gm-panel-scroll">
+                <div class="gm-hint" id="gm-hint"></div>
 
-            ${sec('倍速播放')}
-            <div class="gm-setting-row">
-                <span>原速快捷键 (1.0x)</span>
-                <input type="text" id="gm-hk-speed-normal" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
-            </div>
-            <div class="gm-setting-row">
-                <span>倍速快捷键</span>
-                <input type="text" id="gm-hk-speed-alt" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
-            </div>
-            ${sub('设定倍速', `<select id="cfg-speedAlt" class="gm-select">${
-                SPEED_STEPS.map(s => `<option value="${s}"${config.speedAlt === s ? ' selected' : ''}>${fmtSpeed(s)}</option>`).join('')
-            }</select>`)}
-            ${rowOf('speedSync')}
-            <div class="gm-setting-row" style="margin-top:-6px;">
-                <span style="font-size:12px;color:#999;">改抖音自己的倍速栏后，下一条视频也会按它播</span>
-            </div>
+                <div class="gm-view" id="gm-view-main">
+                    ${sec('画质')}
+                    ${rowOf('videoMaxQuality', sub('目标画质上限', qualityTargetSelect()))}
+                    ${rowOf('liveMaxQuality', sub('目标画质上限', liveQualitySelect()))}
 
-            ${sec('界面与侧栏')}
-            ${rowOf('liquidGlass',
-                sub('真透镜折射',
-                    `<label class="gm-switch"><input type="checkbox" id="cfg-liquidLens" ${config.liquidLens ? 'checked' : ''}><span class="gm-slider"></span></label>`) +
-                sub('按压反馈',
-                    `<label class="gm-switch"><input type="checkbox" id="cfg-glassPress" ${config.glassPress ? 'checked' : ''}><span class="gm-slider"></span></label>`))}
-            ${rowOf('enableSidebar')}
-            ${rowOf('liveSidebar')}
-            ${rowOf('liveCenterSearch')}
-            ${rowOf('hideDownloadApp')}
-            ${rowOf('hideSwitchBtn')}
+                    ${sec('播放')}
+                    ${sub('设定倍速', `<select id="cfg-speedAlt" class="gm-select">${
+                        SPEED_STEPS.map(x => `<option value="${x}"${config.speedAlt === x ? ' selected' : ''}>${fmtSpeed(x)}</option>`).join('')
+                    }</select>`)}
+                    ${rowOf('speedSync')}
+                    ${rowOf('clickPause')}
+                    ${rowOf('doubleFullScreen')}
 
-            ${sec('播放与画质')}
-            ${rowOf('videoMaxQuality', sub('目标画质上限', qualityTargetSelect()))}
-            ${rowOf('liveMaxQuality', sub('目标画质上限', liveQualitySelect()))}
-            ${rowOf('wheelVolume', sub('步进大小 (%)',
-                `<input type="number" id="cfg-volumeStep" class="gm-input" value="${Math.round(config.volumeStep * 100)}" min="1" max="20">`))}
-            ${rowOf('hoverVolumeWheel')}
-            ${rowOf('doubleFullScreen')}
-            ${rowOf('clickPause')}
-            ${rowOf('spacePause')}
-            ${rowOf('resumeAudio')}
+                    ${sec('跳过与过滤')}
+                    ${rowOf('skipAds', sub('跳过方式', actionSelect('adSkipAction')))}
+                    ${rowOf('skipLiveFeed', sub('跳过方式', actionSelect('liveSkipAction')))}
+                    <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;">
+                        <span>自定义黑名单（一行一个关键词，匹配标题或作者自动跳过）</span>
+                        <textarea id="cfg-filterKeywords" class="gm-textarea" placeholder="一行一个关键词，例如：&#10;带货&#10;拼多多&#10;@王者荣耀"></textarea>
+                        <div class="gm-sub-row" style="margin-left:0;">
+                            <span>屏蔽方式</span>${actionSelect('filterSkipAction')}
+                        </div>
+                    </div>
 
-            ${sec('跳过与过滤')}
-            ${rowOf('skipAds', sub('跳过方式', actionSelect('adSkipAction')))}
-            ${rowOf('skipLiveFeed', sub('跳过方式', actionSelect('liveSkipAction')))}
-            ${rowOf('hideEffects')}
-            ${rowOf('hideLivePopups')}
-            ${rowOf('hideGiftMsg')}
-            ${rowOf('hideLuckyBag')}
-            ${rowOf('danmakuSwitchOff')}
-            ${rowOf('hideGiftAudio')}
-            <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;">
-                <span>自定义黑名单（一行一个关键词，匹配标题或作者自动跳过）</span>
-                <textarea id="cfg-filterKeywords" class="gm-textarea" placeholder="一行一个关键词，例如：&#10;带货&#10;拼多多&#10;@王者荣耀"></textarea>
-                <div class="gm-sub-row" style="margin-left:0;">
-                    <span>屏蔽方式</span>${actionSelect('filterSkipAction')}
-                </div>
-            </div>
+                    ${sec('界面')}
+                    ${rowOf('liquidGlass',
+                        sub('真透镜折射',
+                            `<label class="gm-switch"><input type="checkbox" id="cfg-liquidLens" ${config.liquidLens ? 'checked' : ''}><span class="gm-slider"></span></label>`) +
+                        sub('按压反馈',
+                            `<label class="gm-switch"><input type="checkbox" id="cfg-glassPress" ${config.glassPress ? 'checked' : ''}><span class="gm-slider"></span></label>`))}
+                    ${rowOf('enableSidebar')}
+                    ${rowOf('liveSidebar')}
 
-            ${sec('直播间')}
-            ${rowOf('clickPauseLive')}
-            ${rowOf('showViewerCount')}
-            ${rowOf('pollViewerCount', sub('轮询间隔 (秒)',
-                `<input type="number" id="cfg-countPollSec" class="gm-input" value="${config.countPollSec}" min="2" max="30">`))}
-            ${rowOf('detachCam')}
-            <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:-6px;">
-                <span style="font-size:12px;color:#aaa;">摄像头小窗选择器（留空自动识别聊天室上方那块）</span>
-                <input type="text" id="cfg-camSelector" class="gm-sel-input" placeholder="留空 = 自动找聊天室上沿的摄像头画面">
-                <div style="display:flex;gap:8px;justify-content:flex-end;">
-                    <button type="button" id="gm-cam-reset" class="gm-btn">位置复位</button>
-                    <button type="button" id="gm-cam-dump" class="gm-btn">复制候选</button>
+                    ${sec('直播间')}
+                    ${rowOf('showViewerCount')}
+                    ${rowOf('detachCam')}
                 </div>
-            </div>
-            ${rowOf('autoClosePausePopup')}
-            ${rowOf('enableGestures')}
-            ${rowOf('highlightSearch')}
 
-            ${sec('其它')}
-            ${rowOf('crossDomainSync')}
+                <div class="gm-view" id="gm-view-clean" style="display:none">
+                    <div class="gm-hint">所有「去掉界面上某个东西」的开关都在这里。</div>
 
-            <details class="gm-details">
-                <summary>排障与诊断</summary>
-                <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;">
-                    <span>聊天室收起/展开按钮选择器 (可留空)</span>
-                    <input type="text" id="cfg-chatroomToggleSelector" class="gm-sel-input" placeholder="留空 = 自动命中顶栏 ≡→ 按钮">
+                    ${sec('按钮与入口')}
+                    ${rowOf('cleanAiDouyin')}
+                    ${rowOf('cleanListenDouyin')}
+                    ${rowOf('cleanTopClient')}
+                    ${rowOf('cleanDiamond')}
+                    ${rowOf('cleanWallpaper')}
+                    ${rowOf('hideSwitchBtn')}
+                    ${rowOf('hideDownloadApp')}
+
+                    ${sec('弹窗')}
+                    ${rowOf('cleanCollectPopup')}
+                    ${rowOf('cleanSharePopup')}
+                    ${rowOf('hideLivePopups')}
+                    <div class="gm-hint" style="margin-top:-2px;">收藏 / 分享只收掉点出来的面板，右侧工具栏的按钮本身保留。</div>
+
+                    ${sec('特效与弹幕')}
+                    ${rowOf('hideEffects')}
+                    ${rowOf('hideGiftAudio')}
+                    ${rowOf('danmakuSwitchOff')}
+                    <div class="gm-hint" style="margin-top:-2px;">
+                        最后一项是直接去关抖音弹幕设置里的「送礼信息」和「福袋口令」两个开关，
+                        直播间里刷屏的送礼 / 福袋口令就是这么没的；如果发现抢福袋入口也不见了，把它关掉即可。
+                    </div>
                 </div>
-                <div class="gm-setting-row">
-                    <span>复制聊天室顶栏 DOM</span>
-                    <button type="button" id="gm-dump-dom" class="gm-btn">复制</button>
+
+                <div class="gm-view" id="gm-view-keys" style="display:none">
+                    <div class="gm-hint">点一下输入框，然后按下你想要的组合键即可改绑。</div>
+                    <div class="gm-setting-row">
+                        <span>设置面板</span>
+                        <input type="text" id="gm-hotkey-input" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>原速 (1.0x)</span>
+                        <input type="text" id="gm-hk-speed-normal" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>设定倍速</span>
+                        <input type="text" id="gm-hk-speed-alt" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>加速一档</span>
+                        <input type="text" id="gm-hk-speed-up" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>减速一档</span>
+                        <input type="text" id="gm-hk-speed-down" class="gm-hk-input" readonly title="点击后按下你想要的组合键">
+                    </div>
+                    <div class="gm-hint" style="margin-top:8px;">
+                        抖音自带 Z/C/G/F/X/V/P/R/N/B/J/K/Y/H/L/U、空格、↑↓、←→、Shift+= 音量，绑键时避开；选到它占用的组合会提示。
+                    </div>
                 </div>
-                <div class="gm-setting-row">
-                    <span>复制人数诊断</span>
-                    <button type="button" id="gm-dump-count" class="gm-btn">复制</button>
+
+                <div class="gm-view" id="gm-view-adv" style="display:none">
+                    ${sec('播放与音量')}
+                    ${rowOf('wheelVolume', sub('步进大小 (%)',
+                        `<input type="number" id="cfg-volumeStep" class="gm-input" value="${Math.round(config.volumeStep * 100)}" min="1" max="20">`))}
+                    ${rowOf('hoverVolumeWheel')}
+                    ${rowOf('spacePause')}
+                    ${rowOf('resumeAudio')}
+                    ${rowOf('clickPauseLive')}
+
+                    ${sec('直播间')}
+                    ${rowOf('pollViewerCount', sub('轮询间隔 (秒)',
+                        `<input type="number" id="cfg-countPollSec" class="gm-input" value="${config.countPollSec}" min="2" max="30">`))}
+                    ${rowOf('liveCenterSearch')}
+                    ${rowOf('autoClosePausePopup')}
+                    <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:-6px;">
+                        <span style="font-size:12px;color:#aaa;">摄像头小窗选择器（留空自动识别聊天室上方那块）</span>
+                        <input type="text" id="cfg-camSelector" class="gm-sel-input" placeholder="留空 = 自动找聊天室上沿的摄像头画面">
+                        <div style="display:flex;gap:8px;justify-content:flex-end;">
+                            <button type="button" id="gm-cam-reset" class="gm-btn">位置复位</button>
+                            <button type="button" id="gm-cam-dump" class="gm-btn">复制候选</button>
+                        </div>
+                    </div>
+
+                    ${sec('其它')}
+                    ${rowOf('enableGestures')}
+                    ${rowOf('highlightSearch')}
+                    ${rowOf('crossDomainSync')}
                 </div>
-                <div class="gm-setting-row">
-                    <span>复制消息过滤诊断 (含福袋图标排查)</span>
-                    <button type="button" id="gm-dump-filter" class="gm-btn">复制</button>
+
+                <div class="gm-view" id="gm-view-diag" style="display:none">
+                    <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;">
+                        <span>聊天室收起/展开按钮选择器 (可留空)</span>
+                        <input type="text" id="cfg-chatroomToggleSelector" class="gm-sel-input" placeholder="留空 = 自动命中顶栏 ≡→ 按钮">
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制聊天室顶栏 DOM</span>
+                        <button type="button" id="gm-dump-dom" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制人数诊断</span>
+                        <button type="button" id="gm-dump-count" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制消息过滤诊断 (含福袋图标排查)</span>
+                        <button type="button" id="gm-dump-filter" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制直播跳过诊断</span>
+                        <button type="button" id="gm-dump-liveskip" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制画质诊断</span>
+                        <button type="button" id="gm-dump-quality" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制倍速诊断</span>
+                        <button type="button" id="gm-dump-speed" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制倍速菜单候选</span>
+                        <button type="button" id="gm-dump-speedmenu" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制直播画质诊断</span>
+                        <button type="button" id="gm-dump-livequality" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制性能诊断</span>
+                        <button type="button" id="gm-dump-perf" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-hint" style="margin-top:10px;">
+                        这些都是把结构化信息复制到剪贴板，贴给作者即可定位问题，不会改动任何设置。
+                    </div>
                 </div>
-                <div class="gm-setting-row">
-                    <span>复制直播跳过诊断</span>
-                    <button type="button" id="gm-dump-liveskip" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-setting-row">
-                    <span>复制画质诊断</span>
-                    <button type="button" id="gm-dump-quality" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-setting-row">
-                    <span>复制倍速诊断</span>
-                    <button type="button" id="gm-dump-speed" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-setting-row">
-                    <span>复制倍速菜单候选</span>
-                    <button type="button" id="gm-dump-speedmenu" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-setting-row">
-                    <span>复制直播画质诊断</span>
-                    <button type="button" id="gm-dump-livequality" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-setting-row">
-                    <span>复制性能诊断</span>
-                    <button type="button" id="gm-dump-perf" class="gm-btn">复制</button>
-                </div>
-                <div class="gm-hint" style="margin-top:10px;">
-                    这些都是把结构化信息复制到剪贴板，贴给作者即可定位问题，不会改动任何设置。
-                </div>
-            </details>
-        </div>`;
+            </div>`;
+
+        const scrollBox = panel.querySelector('.gm-panel-scroll');
+        /* v9.42：设置面板改成「页签 + 分页」。
+           五个页面（常用 / 清理 / 快捷键 / 高级 / 诊断）全部常驻 DOM，只切 display ——
+           面板里那套 cfg-* 的 change 监听可以一次绑完，切页不重建、不丢焦点。 */
+        const viewEls = {};
+        panel.querySelectorAll('.gm-view').forEach(v => {
+            viewEls[v.id.replace('gm-view-', '')] = v;
+        });
+        const showTab = (name) => {
+            for (const k of Object.keys(viewEls))
+                viewEls[k].style.display = (k === name) ? '' : 'none';
+            panel.querySelectorAll('.gm-tab').forEach(b =>
+                b.classList.toggle('active', b.dataset.tab === name));
+            try { scrollBox.scrollTop = 0; } catch (e) {}
+        };
+        panel.querySelectorAll('.gm-tab').forEach(b => {
+            b.addEventListener('click', () => showTab(b.dataset.tab));
+        });
+        showTab('main');
 
         const textarea = panel.querySelector('#cfg-filterKeywords');
         textarea.value = (config.filterKeywords || []).join('\n');
@@ -9352,6 +10000,13 @@
                 saveConfig();
                 if (key === 'liquidGlass' || key === 'liquidLens' || key === 'glassPress') {
                     applyPanelGlass();
+                }
+                /* v9.41：界面清理的开关变了，立刻重算样式与文案规则 */
+                if (key.indexOf('clean') === 0) {
+                    applyCleanStyle();
+                    safeRun(applyCleanText);
+                    safeRun(ensureCleanPopupObserver);
+                    safeRun(applyCleanPopup);
                 }
                 if (key === 'enableSidebar' || key === 'liveSidebar' ||
                     key === 'liveCenterSearch' || key === 'liveMaxQuality') {
@@ -9421,7 +10076,9 @@
         const HOTKEY_NAME = {
             settingsHotkey: '设置面板',
             speedNormalHotkey: '原速',
-            speedAltHotkey: '倍速'
+            speedAltHotkey: '倍速',
+            speedUpHotkey: '加速一档',
+            speedDownHotkey: '减速一档'
         };
         const bindHotkeyInput = (input, key) => {
             if (!input) return;
@@ -9437,6 +10094,8 @@
         bindHotkeyInput(hotkeyInput, 'settingsHotkey');
         bindHotkeyInput(panel.querySelector('#gm-hk-speed-normal'), 'speedNormalHotkey');
         bindHotkeyInput(panel.querySelector('#gm-hk-speed-alt'), 'speedAltHotkey');
+        bindHotkeyInput(panel.querySelector('#gm-hk-speed-up'), 'speedUpHotkey');
+        bindHotkeyInput(panel.querySelector('#gm-hk-speed-down'), 'speedDownHotkey');
 
         window.addEventListener('keydown', (e) => {
             if (!hotkeyCapturing) return;
@@ -9457,12 +10116,19 @@
                     return;
                 }
             }
+            /* v9.41：撞上抖音自己的键位就提醒一句（仍然保存，用户自己决定） */
+            const clash = douyinConflict(spec);
             config[hotkeyTargetKey] = spec;
             hotkeyCapturing = false;
             if (hotkeyInput) hotkeyInput.classList.remove('capturing');
             saveConfig();
             syncUI();
-            showTip(HOTKEY_NAME[hotkeyTargetKey] + '快捷键已设为 ' + hotkeyLabel(spec), 1800);
+            if (clash) {
+                showTip('已保存，但抖音自己也用 ' + hotkeyLabel(spec) + '（' + clash +
+                    '），可能会同时触发，建议换一个', 3000);
+            } else {
+                showTip(HOTKEY_NAME[hotkeyTargetKey] + '快捷键已设为 ' + hotkeyLabel(spec), 1800);
+            }
         }, true);
 
         let kwTimer = null;
@@ -9473,6 +10139,7 @@
         });
 
         panel.querySelector('#gm-panel-close').addEventListener('click', closePanel);
+
 
         document.addEventListener('pointerdown', (e) => {
             if (!settingsPanel || !settingsPanel.classList.contains('show')) return;
@@ -9517,6 +10184,10 @@
     }, 10000);
 
     /* 首视频起播前就写入画质记忆（等 TASKS 首次执行已经晚于播放器读取） */
+    safeRun(applyCleanStyle);
+    safeRun(applyCleanText);
+    safeRun(ensureCleanPopupObserver);
+    safeRun(applyCleanPopup);
     safeRun(applyVideoMaxQuality);
     /* 直播画质：进房间立刻开一段爆发期，别等 1.5s 周期 */
     safeRun(() => { if (config.liveMaxQuality && (isLiveHost || isLivePage())) kickQualityBurst(8000); });

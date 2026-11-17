@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.42
+// @version      9.43
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -181,8 +181,9 @@
         ['origin', '原画', 5]
     ];
     /* v9.19：配置版本锚点。以后要改结构（拆键、改类型）时按版本号迁移，
-       老用户不会因为缺字段直接吃默认值。 */
-    const CONFIG_VERSION = 2;
+       老用户不会因为缺字段直接吃默认值。
+       v9.43 → 3：人数轮询默认值 4s 改 2s，老存档一次性迁过去。 */
+    const CONFIG_VERSION = 3;
     /* 抖音自带的倍速档位（0.75 ~ 3.0），「设定倍速」只在其中取值 */
     const SPEED_STEPS = [0.75, 1, 1.25, 1.5, 1.75, 2, 3];
 
@@ -230,7 +231,9 @@
         camSelector: '',             // 摄像头小窗的 CSS 选择器（留空自动识别）
         videoMaxQuality: true,       // 视频流（www）默认切到最高画质（超清 4K）
         pollViewerCount: true,       // 主动轮询刷新在线人数
-        countPollSec: 4,             // 人数轮询间隔（秒，2~30）
+        /* v9.43：默认 4s 太慢（加上主循环 1.5s 的延迟，肉眼就是「半天不动」）。
+           现在 2s 轮询 + 350ms 快通道 + 网络推送事件驱动。 */
+        countPollSec: 2,             // 人数轮询间隔（秒，1~30）
         enableGestures: true,
         autoClosePausePopup: true,   // 监听并关闭「长时间无操作，已暂停播放」弹窗
         skipAds: true,               // 推荐流自动跳过广告视频
@@ -289,7 +292,8 @@
                 cfg[k] = CONFIG_VERSION;          // 版本号永远跟当前脚本走
             } else if (k === 'countPollSec') {
                 const n = Number(v);
-                cfg[k] = (Number.isFinite(n) && n >= 2 && n <= 30)
+                /* v9.43：下限从 2s 放到 1s —— 人数刷新要跟上直播推送 */
+                cfg[k] = (Number.isFinite(n) && n >= 1 && n <= 30)
                     ? Math.round(n) : defaultConfig.countPollSec;
             } else if (k === 'volumeStep') {
                 const n = Number(v);
@@ -348,6 +352,10 @@
         let raw = local;
         if (mirror && (!local || (Number(mirror.__ts) || 0) > (Number(local.__ts) || 0))) raw = mirror;
         const cfg = normalize(raw);
+        /* v9.43：老存档里的 4s 就是旧默认值（那时候最小只能选 2s），
+           升级到 v3 时一次性迁到新的 2s。用户自己选的 1/3/5… 一律不动。 */
+        if ((Number(raw && raw.__v) || 0) < 3 && cfg.countPollSec === 4)
+            cfg.countPollSec = defaultConfig.countPollSec;
         /* cookie 镜像里刻意不带档位库（那玩意儿体积大，容易把 cookie 撑爆），
            所以库始终以本地存储为准，别让镜像里的空库把学到的档位清掉。 */
         try {
@@ -5103,6 +5111,11 @@
     let realCountCache = null, lastCountReadAt = 0, scaleCache = null, scaleAt = 0;
     let smallCountStreak = 0;      // 连续出现「疑似别的房间小值」的次数
     let pollFail = 0, pollApiIdx = 0, lastPollAt = 0, pollNote = 'idle', nativeFetchRef = null;
+    /* v9.43：人数刷新的「事件驱动」闸门 —— 网络/WS 一抓到新值就 80ms 后刷一次，
+       不用干等下一个定时器，也不至于一条消息一刷把 DOM 写爆。 */
+    let countRefreshTimer = 0, countRefreshDue = 0;
+    /* 页面自己的人数文本往前走了 → 下一拍立刻主动轮询，不等完整间隔。 */
+    let pollUrgent = false;
 
     const COUNT_KEY_RE  = /display_value|display_long|user_count|online_user|total_user|viewer_count|watch_count|audience_count|room_user|real_count|online_count|visitor_count|view_count|user_num|user_total|room_view_stats/i;
     const COUNT_WEAK_RE = /count|user|view|audience|online|watch|total|num|people/i;
@@ -5162,6 +5175,9 @@
         if (old) { old.at = now; return; }
         countHints.push({ src: src, key: key, value: n, at: now });
         if (countHints.length > 80) countHints.shift();
+        /* v9.43：新数值一到就催一次刷新 —— 以前要等主循环 1.5s 那一拍，
+           现在推送落地后 ~80ms 就能写进页面。 */
+        if (n !== realCountCache) scheduleCountRefresh(80);
     }
     function pushHit(hits, src, key, value, strong) {
         if (COUNT_NOISE_RE.test(key)) return;
@@ -5369,7 +5385,11 @@
     function pollViewerCount() {
         if (!config.showViewerCount || !config.pollViewerCount || !isLivePage()) return;
         const now = Date.now();
-        const gap = Math.max(2000, (Number(config.countPollSec) || 4) * 1000);
+        /* v9.43：下限 2s → 1s。这个间隔是「两次主动复取之间」的最小间隔，
+           实际由 1s 的轮询定时器驱动，所以 1s 的配置是真的 1s。
+           页面自己的人数值刚变过时（pollUrgent）只等 400ms，尽快拿到新精确值。 */
+        const gap = pollUrgent ? 400
+            : Math.max(1000, (Number(config.countPollSec) || 2) * 1000);
         if (pollFail >= 6) {
             if (now - lastPollAt < 30000) return;
             pollFail = 3;                       // 半恢复，继续试
@@ -5377,6 +5397,7 @@
         const url = pickPollUrl();
         if (!url || now - lastPollAt < gap) return;
         lastPollAt = now;
+        pollUrgent = false;
         const f = nativeFetchRef || window.fetch;
         const ok = () => { pollFail = 0; pollApiIdx = 0; };
         const bad = (msg) => {
@@ -5411,6 +5432,12 @@
                 })
                 .catch(function (e) { bad('err ' + String(e && e.message || e)); });
         } catch (e) { bad('throw ' + e); }
+    }
+    /* v9.43：页面自己的人数值刚变过（MutationObserver 里发现）时把这面旗子立起来，
+       下一次 1s 轮询不再等满间隔，400ms 就走。 */
+    function requestPollNow() {
+        if (!config.pollViewerCount) return;
+        pollUrgent = true;
     }
     installCountHooks();
 
@@ -5616,14 +5643,22 @@
     function pickCount(hits) {
         if (!hits || !hits.length) return null;
         const scale = displayedScale();
+        const now = Date.now();
         const score = (h) => {
             let s = h.strong ? 100 : 20;
             if (/display_value|display_long|room_view_stats/.test(h.key)) s += 70;
             else if (COUNT_KEY_RE.test(h.key)) s += 45;
             if (h.src.indexOf('fetch') === 0 || h.src.indexOf('xhr') === 0) s += 40;
-            // v9.6：新鲜度优先于数值大小；静态 SSR / 内联 script 只作兜底
-            if (h.fresh) s += 260;
-            else if (h.at) s -= 80;
+            /* v9.6：新鲜度优先于数值大小；静态 SSR / 内联 script 只作兜底。
+               v9.43：原来只有一个「8 秒内 = 新鲜 +260」的粗档 —— 8 秒前的旧值
+               和刚到手的新值同分，排序退回「谁大谁赢」，人数就看着像不动。
+               这里按年龄分档，最新的一档永远压住旧值。 */
+            if (h.fresh) {
+                const age = h.at ? now - h.at : 9999;
+                if (age < 1500) s += 300;        // 刚抓到的推送
+                else if (age < 3500) s += 240;
+                else s += 160;                   // 3.5~8s 的还能用，但压不过新的
+            } else if (h.at) s -= 80;
             if (h.stale) s -= 140;
             if (scale) s += (h.value >= scale[0] && h.value <= scale[1]) ? 150 : -100;
             if (h.value > 1e9) s -= 120;      // unix 秒 / 毫秒时间戳
@@ -5710,6 +5745,12 @@
             [...countApis].map(x => ({ url: String(x[0]).slice(0, 220), max: x[1].max }))));
         push('poll: ' + pollNote + ' | fails=' + pollFail + ' | gap=' + config.countPollSec + 's' +
              ' | last=' + (lastPollAt ? new Date(lastPollAt).toISOString() : 'never'));
+        /* v9.43：节奏诊断 —— 快通道 350ms，重通道 1.8s，事件驱动 80ms 防抖 */
+        const nowMs = Date.now();
+        push('refresh: fast=350ms | heavyAgo=' +
+             (lastHeavyCountAt ? (nowMs - lastHeavyCountAt) + 'ms' : 'never') +
+             ' | scoreAgo=' + (lastScoreAt ? (nowMs - lastScoreAt) + 'ms' : 'never') +
+             ' | fiberMiss=' + fiberMiss + '/' + fiberTicks);
         push('network hints (' + countHints.length + '): ' + JSON.stringify(countHints.slice(-30)));
         const hits = collectAllCountHits(true);
         push('all candidates (' + hits.length + '): ');
@@ -5765,8 +5806,11 @@
             return document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false).nextNode();
         } catch (e) { return null; }
     }
-    function applyCountText(text) {
-        for (const el of findCountAnchors()) {
+    /* v9.43：允许外部传入已算好的锚点，快通道里就不用再查一遍 DOM。 */
+    function applyCountText(text, anchors) {
+        const list = anchors || findCountAnchors();
+        for (const el of list) {
+            if (!el.isConnected) continue;
             if (!el.hasAttribute('data-gm-orig-count'))
                 el.setAttribute('data-gm-orig-count', (el.textContent || '').trim());
             if (el.getAttribute('data-gm-real-count') !== text)
@@ -5796,12 +5840,21 @@
                     // 旧版把原文本永久劫持成精确值，orig-count 永远停在首次值，
                     // 量级校验因此把后来的新人数全部挡掉。只认带「万/+」的模糊值，
                     // 纯数字是我们自己写的精确值，不作参照。
+                    let advanced = false;
                     for (const el of findCountAnchors(true)) {
                         const cur = ((el.textContent || '') + '').trim();
                         if (cur && cur !== String(realCountCache) && /^[\d.]+(万\+?|\+)$/.test(cur)) {
                             el.setAttribute('data-gm-orig-count', cur);
                             scaleCache = null;
+                            advanced = true;
                         }
+                    }
+                    /* v9.43：抖音自己那一行「1.2万」都往前走了，说明我们手上的
+                       精确值是旧的 —— 立刻重读一次 fiber，并催一发主动轮询，
+                       别让新数字干等 2 秒的轮询间隔。 */
+                    if (advanced) {
+                        scheduleCountRefresh(0);
+                        requestPollNow();
                     }
                     applyCountText(String(realCountCache));
                 });
@@ -5885,68 +5938,41 @@
 
     let lastCountUrl = '';
     let lastPreciseAt = 0, lastCountAcceptAt = 0;
-    function updateViewerCount() {
-        if (location.href !== lastCountUrl) {       // 切换直播间时作废旧缓存
-            lastCountUrl = location.href;
-            realCountCache = null; scaleCache = null;
-            countHints.length = 0;
-            countApis.clear(); pollFail = 0; lastPollAt = 0; pollNote = 'idle';
-            scriptHitsCache = null; globalHitsCache = null;
-            smallCountStreak = 0; lastPreciseAt = 0; lastCountAcceptAt = 0;
-        }
-        if (!config.showViewerCount) {
-            if (document.querySelector('[data-gm-real-count]')) restoreCountText();
-            realCountCache = null; scaleCache = null;
-            return;
-        }
-        if (!isLivePage()) return;              // 视频流页不做人数扫描，避免误伤其它「x万」文本
-        const now = Date.now();
-        if (now - lastCountReadAt > 1000) {          // v9.8：配合 4s 轮询缩短节流
-            lastCountReadAt = now;
-            /* ① 首选：内部 store 的精确人数（实时，不会认错） */
-            let precise = null;
-            try { precise = preciseCountFromFiber(); } catch (e) {}
-            if (precise != null) {
-                lastPreciseAt = now;
-                lastCountAcceptAt = now;
-                realCountCache = precise;
-                smallCountStreak = 0;
-                widenScale(precise);      // 人数涨过旧量级时把参照区间抬上去
-            } else {
-                /* ② 兜底：网络 / fiber / 全局 / script 打分 */
-                const real = pickCount(collectAllCountHits());
-                if (real != null) {
-                    lastCountAcceptAt = now;
-                    /* 在线人数不会在几秒内腰斩成三位数。突降到上次值 45% 以下时
-                       先沿用旧值，连续两次都这么小才接受，避免长时间后被
-                       推荐房间的小值带偏（刷新后又正常的那个现象）。 */
-                    if (realCountCache != null && real < realCountCache * 0.45) {
-                        smallCountStreak++;
-                        if (smallCountStreak >= 2) {
-                            realCountCache = real; smallCountStreak = 0;
-                        }
-                    } else {
-                        realCountCache = real; smallCountStreak = 0;
-                    }
-                } else if (realCountCache != null && now - lastCountAcceptAt > 20000) {
-                    /* 精确源 20 秒没更新、打分也拿不到：把显示还给抖音自己。
-                       宁可显示「1.2万」这种模糊值，也不要冻在一个错的数字上。 */
-                    restoreCountText();
-                    realCountCache = null; scaleCache = null; lastPreciseAt = 0;
-                    return;
-                }
-            }
-        }
-        if (realCountCache == null) return;
-        findCountAnchors(true);                  // 全屏/收起切换后锚点会被 React 换掉
-        const text = String(realCountCache);
-        applyCountText(text);
-        watchCountNodes();
+    /* v9.43：人数刷新改成「快通道 + 重通道」两档节奏。
+       旧版整条链路挂在 1.5s 主循环里，内部再节流 1s，轮询最低还要 2s：
+       抖音这边人数推送已经到了，页面上的数字却要 2~4 秒才动一下，
+       肉眼看就是「人数半天不更新」。现在：
+         快通道 350ms —— 只读 fiber 里的精确值 + 改文本，开销极小；
+         重通道 ~1.8s —— 打分兜底、观察器、顶栏其它「x万」补扫；
+         事件驱动 —— 网络 / WS 抓到新数值立刻催一次（80ms 防抖）。 */
+    let lastHeavyCountAt = 0, lastScoreAt = 0, fiberMiss = 0, fiberTicks = 0;
 
-        // 兜底：顶部区域其它「x万」短文本，同样直接改文本节点
+    /* 事件驱动的刷新闸门：只保留最近的那一次，never 堆积任务。 */
+    function scheduleCountRefresh(delay) {
+        if (!config.showViewerCount) return;
+        const now = Date.now();
+        const due = now + (delay == null ? 80 : delay);
+        if (countRefreshTimer && due >= countRefreshDue) return;   // 已有更早的排队
+        countRefreshDue = due;
+        clearTimeout(countRefreshTimer);
+        countRefreshTimer = setTimeout(function () {
+            countRefreshTimer = 0;
+            try { updateViewerCount(true); } catch (e) {}
+        }, Math.max(0, due - now));
+    }
+
+    /* 缓存的锚点被 React 换掉时立刻重找，别往已经摘掉的节点里写文本。 */
+    function countAnchorsFast() {
+        if (!countAnchorCache.length) return findCountAnchors(true);
+        for (const el of countAnchorCache) if (!el.isConnected) return findCountAnchors(true);
+        return findCountAnchors();
+    }
+
+    /* 顶栏里还有别的「1.2万」短文本（不是人数条本身），一起改成精确值。 */
+    function paintTopCountText(text) {
         const countRe = /^\d+(\.\d+)?万\+?$/;
         let found = 0;
-        /* v9.19：先扫顶栏容器，别每 1.5s 全页过 4000 个文本节点。
+        /* v9.19：先扫顶栏容器，别每轮全页过 4000 个文本节点。
            顶栏找不到（改版/全屏）再退回 body。 */
         const topRoot = document.querySelector(
             '#douyin-header, [id^="douyin-header"], [data-e2e*="header"], [class*="header"]') ||
@@ -5971,6 +5997,99 @@
         });
         scan(topRoot, 1200);
         if (!found && topRoot !== document.body) scan(document.body || document, 2000);
+    }
+
+    function updateViewerCount(force) {
+        if (location.href !== lastCountUrl) {       // 切换直播间时作废旧缓存
+            lastCountUrl = location.href;
+            realCountCache = null; scaleCache = null;
+            countHints.length = 0;
+            countApis.clear(); pollFail = 0; lastPollAt = 0; pollNote = 'idle';
+            scriptHitsCache = null; globalHitsCache = null;
+            smallCountStreak = 0; lastPreciseAt = 0; lastCountAcceptAt = 0;
+            lastScoreAt = 0; lastHeavyCountAt = 0; fiberMiss = 0;
+            pollUrgent = false;
+            if (countRefreshTimer) { clearTimeout(countRefreshTimer); countRefreshTimer = 0; }
+        }
+        if (!config.showViewerCount) {
+            if (document.querySelector('[data-gm-real-count]')) restoreCountText();
+            realCountCache = null; scaleCache = null;
+            return;
+        }
+        if (!isLivePage()) return;              // 视频流页不做人数扫描，避免误伤其它「x万」文本
+        const now = Date.now();
+        if (!force && now - lastCountReadAt < 300) return;   // 定时器 350ms，正常不会被挡
+        lastCountReadAt = now;
+
+        /* ① 首选：内部 store 的精确人数（实时，不会认错）。
+           连续 8 拍读不到就降到每 4 拍试一次，别在没有 room_store 的页面上白跑链路。 */
+        let precise = null;
+        fiberTicks++;
+        if (fiberMiss < 8 || fiberTicks % 4 === 0) {
+            try { precise = preciseCountFromFiber(); } catch (e) {}
+        }
+        if (precise != null) {
+            fiberMiss = 0;
+            lastPreciseAt = now;
+            /* v9.43：现在 350ms 读一次，比原来勤得多 —— 右侧推荐位的房间卡
+               万一被读进来，数字会一闪一闪。真骤降（< 上次 45%）先挂一拍，
+               连拍两次才认；回退最多 350ms，肉眼无感。 */
+            let accept = true;
+            if (realCountCache != null && precise < realCountCache * 0.45) {
+                smallCountStreak++;
+                accept = smallCountStreak >= 2;
+            } else {
+                smallCountStreak = 0;
+            }
+            if (accept) {
+                realCountCache = precise;
+                smallCountStreak = 0;
+                lastCountAcceptAt = now;
+                widenScale(precise);      // 人数涨过旧量级时把参照区间抬上去
+            }
+        } else {
+            fiberMiss++;
+            /* ② 兜底：网络 / fiber / 全局 / script 打分。
+               这是重活，平时 1.5s 才跑一次；被事件催的时候放宽到 450ms，
+               让刚抓到的数值尽快生效。 */
+            const scoreGap = force ? 450 : 1500;
+            if (now - lastScoreAt >= scoreGap) {
+                lastScoreAt = now;
+                const real = pickCount(collectAllCountHits());
+                if (real != null) {
+                    lastCountAcceptAt = now;
+                    /* 在线人数不会在几秒内腰斩成三位数。突降到上次值 45% 以下时
+                       先沿用旧值，连续两次都这么小才接受，避免长时间后被
+                       推荐房间的小值带偏（刷新后又正常的那个现象）。 */
+                    if (realCountCache != null && real < realCountCache * 0.45) {
+                        smallCountStreak++;
+                        if (smallCountStreak >= 2) {
+                            realCountCache = real; smallCountStreak = 0;
+                        }
+                    } else {
+                        realCountCache = real; smallCountStreak = 0;
+                    }
+                } else if (realCountCache != null && now - lastCountAcceptAt > 20000) {
+                    /* 精确源 20 秒没更新、打分也拿不到：把显示还给抖音自己。
+                       宁可显示「1.2万」这种模糊值，也不要冻在一个错的数字上。 */
+                    restoreCountText();
+                    realCountCache = null; scaleCache = null; lastPreciseAt = 0;
+                    return;
+                }
+            }
+        }
+        if (realCountCache == null) return;
+        const text = String(realCountCache);
+        applyCountText(text, countAnchorsFast());   // 快通道：只写文本，350ms 一次
+
+        /* ③ 重通道：锚点重建 + 观察器 + 顶栏补扫，1.8s 一次足够 */
+        if (now - lastHeavyCountAt > 1800) {
+            lastHeavyCountAt = now;
+            findCountAnchors(true);                 // 全屏/收起切换后锚点会被 React 换掉
+            applyCountText(text);
+            watchCountNodes();
+            paintTopCountText(text);
+        }
     }
 
     /* ---- 7.7 评论区「点一下会触发抖音搜索」的词高亮 ----
@@ -9339,8 +9458,8 @@
         keepPlaybackRate,          // 直播流自己会跳过（duration=Infinity）
         guardResumeAudio,
         hideLivePopupsTask,
-        updateViewerCount,
-        pollViewerCount,
+        /* v9.43：updateViewerCount / pollViewerCount 从这里挪走了 ——
+           它们改由下面的专属定时器驱动（350ms / 1s），不再被 1.5s 主循环拖慢。 */
         muteGiftAudios
     ];
 
@@ -9358,7 +9477,7 @@
     function perfReport() {
         const rows = Array.from(taskCost.entries()).sort((a, b) => b[1] - a[1]);
         const sum = rows.reduce((s, r) => s + r[1], 0);
-        const lines = ['# 抖音优化 · 任务耗时（每 1.5s 一轮，衰减平均）',
+        const lines = ['# 抖音优化 · 任务耗时（人数任务 350ms/1s 一拍，其余 1.5s 一轮，衰减平均）',
             'url: ' + location.href,
             'live: ' + (isLiveHost || isLivePage()) + ' hidden: ' + document.hidden,
             'totalMs: ' + sum.toFixed(2)];
@@ -9377,6 +9496,19 @@
            www，把搜索框居中、弹幕设置这些 live 任务全跳过。 */
         for (const fn of ((isLiveHost || isLivePage()) ? LIVE_TASKS : WWW_TASKS)) timedTask(fn);
     }, 1500);
+
+    /* v9.43：人数用自己的一套定时器。
+       快通道 350ms：非直播页几乎零成本（两次 isLivePage 查询就返回）；
+       逻辑本身还带 300ms 节流 + fiber 降频，读不到 room_store 时不会空转。 */
+    setInterval(() => {
+        if (document.hidden || !isLivePage()) return;
+        timedTask(updateViewerCount);
+    }, 350);
+    /* 轮询 1s 一拍，真正的间隔由「设置里的秒数」决定（默认 2s）。 */
+    setInterval(() => {
+        if (document.hidden || !isLivePage()) return;
+        timedTask(pollViewerCount);
+    }, 1000);
 
     /* =====================================================================
      * 10. 设置面板：可自定义快捷键 / Esc 关闭 / 菜单命令桥接
@@ -9762,7 +9894,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.42</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.43</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>
@@ -9877,7 +10009,7 @@
 
                     ${sec('直播间')}
                     ${rowOf('pollViewerCount', sub('轮询间隔 (秒)',
-                        `<input type="number" id="cfg-countPollSec" class="gm-input" value="${config.countPollSec}" min="2" max="30">`))}
+                        `<input type="number" id="cfg-countPollSec" class="gm-input" value="${config.countPollSec}" min="1" max="30">`))}
                     ${rowOf('liveCenterSearch')}
                     ${rowOf('autoClosePausePopup')}
                     <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:-6px;">
@@ -9987,7 +10119,7 @@
                     let val = parseFloat(e.target.value);
                     if (!Number.isFinite(val)) return;
                     if (key === 'countPollSec') {
-                        val = Math.max(2, Math.min(30, Math.round(val)));
+                        val = Math.max(1, Math.min(30, Math.round(val)));
                         config[key] = val;
                     } else {
                         val = Math.max(1, Math.min(20, val));

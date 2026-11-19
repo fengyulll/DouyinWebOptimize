@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.45
+// @version      9.46
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -9790,7 +9790,7 @@
         ['detachCam',         '摄像头小窗独立浮出 (可拖动)'],
         ['pollViewerCount',   '主动轮询刷新在线人数'],
         ['enableGestures',    '鼠标手势 (长按/中键)'],
-        ['hideEffects',       '屏蔽礼物/点赞特效'],
+        ['hideEffects',       '屏蔽礼物特效与底部礼物栏'],
         ['skipAds',           '自动跳过广告视频'],
         ['skipLiveFeed',      '自动跳过推荐直播'],
         ['hideSwitchBtn',     '屏蔽切换播放↑↓按钮'],
@@ -10120,7 +10120,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.45</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.46</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>
@@ -10189,6 +10189,10 @@
 
                     ${sec('特效与弹幕')}
                     ${rowOf('hideEffects')}
+                    <div class="gm-hint" style="margin-top:-2px;">
+                        第一项同时管「礼物 / 点赞特效」和「直播间底部那条礼物栏」——它们本来就是一套，
+                        关掉它特效和礼物栏会一起回来。
+                    </div>
                     ${rowOf('hideGiftAudio')}
                     ${rowOf('danmakuSwitchOff')}
                     <div class="gm-hint" style="margin-top:-2px;">

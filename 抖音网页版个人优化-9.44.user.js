@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.43
+// @version      9.44
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -30,12 +30,14 @@
     const initStyle = document.createElement('style');
     initStyle.id = 'gm-init-styles';
     initStyle.textContent = `
-        html, body { background-color: #161616 !important; margin: 0 !important; padding: 0 !important; }
-        /* 顶栏不铺满时，0~164px 露出的是 html/body 底色，必须和侧栏同色。
-           live 首页之前用纯黑 body，导致左上角与悬浮栏之间出现明显黑块。
-           直播间由下面 #root 的不透明黑底覆盖，改 body 不影响房间页观感。 */
-        html.xydy-www  #root, html.xydy-www  #dark { background-color: #161616 !important; }
-        html.xydy-live #root, html.xydy-live #dark { background-color: #000000 !important; }
+        html, body { margin: 0 !important; padding: 0 !important; }
+        /* v9.44：页面底色全部交回给抖音自己的容器。
+           以前这里写死了三处：「html/body = #161616」「#root/#dark =
+           #161616（www）/ #000（live）」，用「补色块」的方式盖住悬浮侧栏
+           腾出来的那条缝。抖音改过一次配色之后，我们补的这块就和它自己的
+           底色对不上，缝反而变成一眼能看见的异色块。
+           现在一处都不写死：抖音的容器是什么色就让它自己铺什么色，
+           包括顶栏左边那条缝。我们只负责把搜索框摆到视口正中。 */
         [data-gm-popup-hidden], [data-gm-pause-hidden] { display: none !important; }
     `;
     html.appendChild(initStyle);
@@ -928,9 +930,9 @@
                     left: 0 !important;
                     flex: 1 1 auto !important; width: 100% !important; min-width: 0 !important;
                     margin-left: 0 !important; padding-left: 0 !important;
+                    /* v9.44：不再给它刷 #161616 / #000。底色由抖音自己那层容器决定，
+                       我们写死就会和它当前配色对不上。 */
                 }
-                html.xydy-sidebar-on.xydy-www  #douyin-right-container { background-color: #161616 !important; }
-                html.xydy-sidebar-on.xydy-live #douyin-right-container { background-color: #000000 !important; }
                 html.xydy-sidebar-on #sliderVideo,
                 html.xydy-sidebar-on .parent-route-container,
                 html.xydy-sidebar-on #slider-card {
@@ -9894,7 +9896,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.43</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.44</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

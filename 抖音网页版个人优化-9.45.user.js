@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.44
+// @version      9.45
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -31,7 +31,7 @@
     initStyle.id = 'gm-init-styles';
     initStyle.textContent = `
         html, body { margin: 0 !important; padding: 0 !important; }
-        /* v9.44：页面底色全部交回给抖音自己的容器。
+        /* v9.45：页面底色全部交回给抖音自己的容器。
            以前这里写死了三处：「html/body = #161616」「#root/#dark =
            #161616（www）/ #000（live）」，用「补色块」的方式盖住悬浮侧栏
            腾出来的那条缝。抖音改过一次配色之后，我们补的这块就和它自己的
@@ -184,8 +184,9 @@
     ];
     /* v9.19：配置版本锚点。以后要改结构（拆键、改类型）时按版本号迁移，
        老用户不会因为缺字段直接吃默认值。
-       v9.43 → 3：人数轮询默认值 4s 改 2s，老存档一次性迁过去。 */
-    const CONFIG_VERSION = 3;
+       v9.43 → 3：人数轮询默认值 4s 改 2s，老存档一次性迁过去。
+       v9.45 → 4：跨域名同步默认开启，老存档里的 false（旧默认值）一并迁过去。 */
+    const CONFIG_VERSION = 4;
     /* 抖音自带的倍速档位（0.75 ~ 3.0），「设定倍速」只在其中取值 */
     const SPEED_STEPS = [0.75, 1, 1.25, 1.5, 1.75, 2, 3];
 
@@ -243,7 +244,9 @@
         adSkipAction: 'next',        // 广告跳过方式：next=只划走 / block=点不感兴趣
         liveSkipAction: 'block',     // 直播跳过方式：block=点不感兴趣 / next=只划走
         chatroomToggleSelector: '',  // 聊天室收起/展开按钮的自定义 CSS 选择器（留空自动查找）
-        crossDomainSync: false,
+        /* v9.45：默认开启 —— www / live 两个域名共用一份配置，
+           在一边改的开关另一边立刻生效，不用再各调一遍。 */
+        crossDomainSync: true,
         /* v9.38：设置面板的「液态玻璃」外观（D 样板材质 + C 样板按压反馈/圆角）。
            纯 CSS 实现，只切一个 class，关掉立刻回到原来的不透明深色面板。
            liquidLens：真透镜折射（SDF 位移滤镜），仅液态玻璃开启时生效。
@@ -358,6 +361,10 @@
            升级到 v3 时一次性迁到新的 2s。用户自己选的 1/3/5… 一律不动。 */
         if ((Number(raw && raw.__v) || 0) < 3 && cfg.countPollSec === 4)
             cfg.countPollSec = defaultConfig.countPollSec;
+        /* v9.45：跨域名同步改成默认开启。老存档里存的是旧默认值 false，
+           升级到 v4 时一起打开（想关的话在面板里关掉，之后不会再被改回去）。 */
+        if ((Number(raw && raw.__v) || 0) < 4 && cfg.crossDomainSync === false)
+            cfg.crossDomainSync = true;
         /* cookie 镜像里刻意不带档位库（那玩意儿体积大，容易把 cookie 撑爆），
            所以库始终以本地存储为准，别让镜像里的空库把学到的档位清掉。 */
         try {
@@ -776,7 +783,9 @@
                     transform: translateY(-50%) !important;
                     border-radius: 20px !important;
                     border: 1px solid rgba(255,255,255,0.10) !important;
-                    background-color: #161616 !important;
+                    /* v9.45：底板颜色由 JS 从抖音自己的容器读出来（--gm-nav-bg），
+                       读不到才退回 #161616。抖音换配色时这里自动跟上。 */
+                    background-color: var(--gm-nav-bg, #161616) !important;
                     background-image: none !important;
                     background-clip: padding-box !important;
                     box-shadow: 0 8px 24px rgba(0,0,0,0.45) !important;
@@ -930,7 +939,7 @@
                     left: 0 !important;
                     flex: 1 1 auto !important; width: 100% !important; min-width: 0 !important;
                     margin-left: 0 !important; padding-left: 0 !important;
-                    /* v9.44：不再给它刷 #161616 / #000。底色由抖音自己那层容器决定，
+                    /* v9.45：不再给它刷 #161616 / #000。底色由抖音自己那层容器决定，
                        我们写死就会和它当前配色对不上。 */
                 }
                 html.xydy-sidebar-on #sliderVideo,
@@ -1637,6 +1646,56 @@
             lastSidebarState = key;
             updateSidebarFlag();
         }
+    }
+
+    /* ---- 侧栏底板：读抖音自己容器的底色，不再写死 ----
+       v9.45：抖音换过一次配色之后，#161616 就它的底不再是同一个色了。
+       这里每次（最多 2s 一次）从页面自己那层容器上取当前底色，写进
+       CSS 变量 --gm-nav-bg，侧栏卡片跟着变，以后再换配色也不用改脚本。
+       读取顺序：
+         ① 侧栏根节点的祖先（往上 6 层）—— 抖音给侧栏铺的那层底，
+            我们只改了根节点本身，祖先的底色还是抖音原样；
+         ② #root / #dark / body / html —— 页面级容器；
+       只在「不透明 + 深色」时采用；全是透明或读不到就退回 #161616，
+       避免卡片突然变透明。（根节点自己不读：它的底色已经被我们改成
+       var(--gm-nav-bg)，读它等于读自己，会锁死在旧值上。） */
+    let navBgValue = '', navBgAt = 0;
+    function readSurfaceColor() {
+        const pick = (el) => {
+            if (!el || el.nodeType !== 1) return '';
+            let c = '';
+            try { c = window.getComputedStyle(el).backgroundColor || ''; } catch (e) { return ''; }
+            const m = /^rgba?\(([^)]+)\)$/.exec(c);
+            if (!m) return '';
+            const p = m[1].split(',').map(Number);
+            const a = p.length > 3 ? p[3] : 1;
+            if (!(a >= 0.9)) return '';                 // 半透明不算「铺了底」
+            const lum = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+            if (lum > 150) return '';                   // 亮色底不算（侧栏是深色面板）
+            return 'rgb(' + (p[0] | 0) + ',' + (p[1] | 0) + ',' + (p[2] | 0) + ')';
+        };
+        let el = (sidebarRoot && sidebarRoot.isConnected) ? sidebarRoot.parentElement : null;
+        let d = 0;
+        while (el && d++ < 6) {
+            const c = pick(el);
+            if (c) return c;
+            el = el.parentElement;
+        }
+        for (const sel of ['#root', '#dark', 'body', 'html']) {
+            const c = pick(document.querySelector(sel));
+            if (c) return c;
+        }
+        return '';
+    }
+    function syncNavBg() {
+        if (!sidebarEnabled()) return;
+        const now = Date.now();
+        if (now - navBgAt < 2000) return;               // getComputedStyle 不便宜，2s 一次够了
+        navBgAt = now;
+        const val = readSurfaceColor() || '#161616';    // 读不到就保持原来的固定色
+        if (val === navBgValue) return;
+        navBgValue = val;
+        try { html.style.setProperty('--gm-nav-bg', val); } catch (e) {}
     }
     updateSidebarFlag();
     lastSidebarState = sidebarEnabled() + '|' + sidebarSuppressed();
@@ -3510,6 +3569,20 @@
             }
             usable.sort((a, b) => b.score - a.score);
             const best = usable[0];
+            /* v9.45：视频流这边**只往上爬，绝不把全局偏好往下拉**。
+               点菜单里任何一档，抖音都会把它写进 MANUAL_SWITCH —— 那是全局偏好：
+               在「最高只有 720P」的视频上点了一下 720P，后面所有 4K 视频就都起在
+               720P 了（用户看到的就是「第一个视频 720，之后全 720」）。
+               所以只在这一档比当前偏好更高时才点；不比当前高就直接收工，
+               这点画质交给播放器自己按视频能力回退。 */
+            if (!live) {
+                const prefLv = vqLevelOf(vqParse(vqRead())) || 0;
+                if (lvOf(best.text) <= prefLv) {
+                    qualityDone = true;
+                    qualityNote = 'no tier above pref(' + prefLv + '), keep "' + (curTxt || '-') + '"';
+                    return 'max';
+                }
+            }
             const atBest = live
                 ? (curTxt && liveLevelOf(best.text) === liveLevelOf(curTxt))
                 : (curTxt && best.score <= qualityScore(curTxt));
@@ -3984,6 +4057,10 @@
     const VQ_BACKUP_KEY = 'gm_dy_quality_backup';
     const VQ_LEARNED_KEY = 'gm_dy_quality_max';   // 旧版单模板键，仅用于迁移
     let vqUrl = '', vqApplied = false, vqUserOverridden = false, vqWrites = 0;
+    /* v9.45：按「视频」而不是按「页面」维护状态。抖音推荐页一直在同一个 URL 上
+       滚视频，以前只在 URL 变化时重置 —— 第一个视频爬到的档位会一路带到后面，
+       第一个视频最高只有 720P 时，后面的 4K 视频也跟着起在 720P。 */
+    let vqVideoId = '';
     let vqWroteRaw = '';   // 我们最后一次写进 MANUAL_SWITCH 的原文，用来区分「用户改的」和「我们写的」
     /* 新版播放器清晰度是 xgplayer 组件，额外走一条「点它自己档位」的路 */
     let vqXgCooldown = 0, vqXgTries = 0, vqXgDone = false, vqNote = '';
@@ -4350,7 +4427,10 @@
     try {
         if (location.hostname === 'www.douyin.com' && config.videoMaxQuality) {
             const pick0 = vqTplForTarget();
-            if (pick0) {
+            /* v9.45：只有到了目标档位的模板才抢在装载前写。低档模板写进去就是
+               全局偏好，会让后面的高档视频也跟着降档。 */
+            const lv0 = vqTargetLevel();
+            if (pick0 && (lv0 <= 0 || pick0.level >= lv0)) {
                 const raw0 = vqRead();
                 if (!vqIsMax(vqParse(raw0))) {
                     vqBackupOnce(raw0);
@@ -4363,6 +4443,26 @@
             }
         }
     } catch (e) {}
+    /* v9.45：当前视频的 id（用来判断「换视频了」）。
+       只读清晰度插件 config 里的 awemeInfo.awemeId，**不拿 <video> 的 src 兜底**：
+       同一支视频换档位后 src 也会变，拿它当身份证会把「切档位」误判成「换视频」，
+       重置状态后又要重新爬一档 —— 来回循环。读不到就当没换，保持旧行为。 */
+    function vqAwemeId() {
+        try {
+            const pl = window.player && window.player.plugins;
+            if (pl) {
+                const list = Array.isArray(pl) ? pl : Object.keys(pl).map(k => pl[k]);
+                for (const p of list) {
+                    if (!p || typeof p !== 'object') continue;
+                    let ai = null;
+                    try { ai = (p.config && p.config.awemeInfo) || p.awemeInfo; } catch (e) {}
+                    if (ai && ai.awemeId) return String(ai.awemeId);
+                }
+            }
+        } catch (e) {}
+        return '';
+    }
+
     function applyVideoMaxQuality() {
         if (!config.videoMaxQuality) { restoreVideoQuality(); return; }
         if (isLivePage() || location.hostname !== 'www.douyin.com') return;
@@ -4370,6 +4470,18 @@
             vqUrl = location.href; vqApplied = false; vqUserOverridden = false; vqWrites = 0;
             vqXgTries = 0; vqXgCooldown = 0; vqXgDone = false; vqNote = '';
             vqTplTryAt = 0; xgHoverAt = 0;
+            vqVideoId = '';
+        }
+        /* ⓪-a v9.45：换了一个视频就把「爬档位」的状态重置一次。
+           推荐流一直在同一个 URL 上滚，只看 URL 的话第一个视频的状态会一直沿用：
+           第一个视频最高 720P（点完就是"已达标"），后面的 4K 视频再也不会去点。 */
+        const vid = vqAwemeId();
+        if (vid && vid !== vqVideoId) {
+            vqVideoId = vid;
+            vqApplied = false; vqUserOverridden = false; vqWrites = 0;
+            vqXgTries = 0; vqXgCooldown = 0; vqXgDone = false;
+            vqTplTryAt = 0; xgHoverAt = 0;
+            vqNote = 'new video, reset';
         }
         /* 〇 已删除：原来先调 window.player.changeDefinition 直接切档。
            实测会把点播视频切成 0x0 播不出来，整条路径已移除。 */
@@ -4390,15 +4502,29 @@
         vqEnsureTemplate();
 
         /* ① 有目标档位对象就回放 —— www 页唯一「不弹菜单、不点按钮」就能生效的路径：
-              播放器每次装载视频都会读 MANUAL_SWITCH。 */
+              播放器每次装载视频都会读 MANUAL_SWITCH。
+              v9.45：只有「库里这份模板真的到了目标档位」才回放。
+              以前是「取库里不超过目标里最高的那份」，库里有 720P 就写 720P ——
+              MANUAL_SWITCH 是全局偏好，写了之后连 4K 视频也起在 720P
+              （「第一个视频最高 720P，后面全变 720P」就是这么来的）。
+              够不到目标时，回放让位给下面的清晰度菜单：点当前视频能吃的最高档，
+              抖音自己会写 MANUAL_SWITCH，我们再学进库，库才会往上长。 */
         const pick = vqTplForTarget();
-        if (pick && !vqIsMax(cur) && !vqUserOverridden && vqWrites <= 4) {
+        const targetLv0 = vqTargetLevel();
+        const canReplay = !!pick && (targetLv0 <= 0 || pick.level >= targetLv0);
+        if (canReplay && !vqIsMax(cur) && !vqUserOverridden && vqWrites <= 4) {
             /* 上一轮我们写过、现在还没到目标档：先分清是谁改的 ——
-               · 当前值就是我们写的那份 → 播放器没接受，不是用户改的，
+               · 当前值和我们写的是同一档（抖音只是把 clarityReal 换成了
+                 当前视频自己的列表）→ 算生效，不是用户改的；
+               · 当前值就是我们写的那份原文 → 播放器没接受，不是用户改的，
                  不能因此永久停手（之前就是这里把 override 置 true，后续全停了）；
-               · 当前值被换掉了     → 才认定用户自己在菜单里选了别的。 */
+               · 当前值被换成了别的档位 → 才认定用户自己在菜单里选了别的。 */
+            const sameGear = !!(cur && pick && vqLevelOf(cur) === pick.level &&
+                                vqLabelOf(cur) === pick.name);
             if (vqApplied) {
-                if (raw === vqWroteRaw) {
+                if (sameGear) {
+                    vqApplied = false;
+                } else if (raw === vqWroteRaw) {
                     vqApplied = false;
                     /* 同一份对象写两遍都不生效，说明播放器不认，从库里剔掉重学 */
                     if (vqWrites >= 2) {
@@ -4596,6 +4722,14 @@
                 const p = vqTplForTarget();
                 return p ? p.name + ' (lg=' + p.level + ')' : '(目标档位还没采集到)';
             })(),
+            /* v9.45：这一拍到底会不会回放模板（模板没到目标档就不写，改为点菜单爬档） */
+            'canReplay: ' + (function () {
+                const p = vqTplForTarget(), t = vqTargetLevel();
+                if (!p) return 'no (库里没有可用模板)';
+                if (t <= 0 || p.level >= t) return 'yes';
+                return 'no (模板 lg=' + p.level + ' < 目标 ' + t + '，改走菜单爬档)';
+            })(),
+            'videoId: ' + (vqVideoId || '(未读到 awemeId)'),
             'applied: ' + vqApplied + ' override: ' + vqUserOverridden + ' writes: ' + vqWrites,
             'videoDom: xgTries=' + vqXgTries + ' note=' + (vqNote || '-'),
             vqProbe(),
@@ -5139,8 +5273,16 @@
             scaleCache = [Math.max(1, v * 0.4), v * 2.5];
         scaleAt = Date.now();
     }
+    /* v9.45：只把「房间级」接口记进复取清单，并且只认它。
+       之前把 `/webcast/web/feed/follow/`（推荐流）也记下来了：轮询它
+       每次回来的是**几十个房间**的人数（120~500 那一堆），全被当成
+       「新鲜候选」。真实房间那 2 万在打分里被这批小数压掉，显示就锁在
+       小房间的数字上了 —— 诊断里显示 429、量级 [134,837.5] 就是这么来的。 */
+    const ROOM_API_RE = /\/webcast\/room\/(web\/enter|info|web\/info|stats|info_by_scene|web\/stats)/i;
+    const FEED_API_RE = /\/(feed|recommend|hot|rank|ranklist)\//i;
     function rememberApi(url, maxVal) {
         if (!url || !/^https?:/.test(url) || !(maxVal >= 100)) return;
+        if (!ROOM_API_RE.test(url) || FEED_API_RE.test(url)) return;
         if (countApis.has(url)) countApis.delete(url);
         countApis.set(url, { max: maxVal, at: Date.now() });
         while (countApis.size > 8) countApis.delete(countApis.keys().next().value);
@@ -5149,6 +5291,7 @@
         let best = null, bestDiff = Infinity;
         const ref = realCountCache || 0;
         for (const entry of countApis) {
+            if (!ROOM_API_RE.test(entry[0])) continue;      // 只轮询房间级接口
             const diff = ref ? Math.abs(entry[1].max - ref) / ref : -entry[1].max;
             if (diff < bestDiff) { bestDiff = diff; best = entry[0]; }
         }
@@ -5215,6 +5358,21 @@
         if (!text || typeof text !== 'string' || text.length > 1500000) return;
         if (!COUNT_TEXT_RE.test(text)) return;
         let maxVal = 0, guard = 0, m;
+        /* v9.45：先单独捞「本房间」的那份 room_view_stats。
+           直播接口的响应里除了当前房间，还可能夹着推荐位 / 关联房间的数据，
+           它们同样叫 display_value。room_view_stats 只属于当前房间，
+           单拎出来打高分，避免跟别的房间的数字混在一锅里比。 */
+        if (text.indexOf('room_view_stats') >= 0) {
+            const RVS_RE = /"room_view_stats"\s*:\s*\{[^{}]{0,400}?"display_(?:value|long)"\s*:\s*"?([0-9][0-9,]{0,12})/g;
+            let rv, g2 = 0;
+            while ((rv = RVS_RE.exec(text)) !== null && g2++ < 8) {
+                const n = toCount(rv[1]);
+                if (n == null) continue;
+                if (n > maxVal) maxVal = n;
+                if (hits) pushHit(hits, src, 'room_view_stats', rv[1], true);
+                else pushHint(src, 'room_view_stats', rv[1]);
+            }
+        }
         COUNT_FIELD_RE.lastIndex = 0;
         while ((m = COUNT_FIELD_RE.exec(text)) !== null && guard++ < 120) {
             const n = toCount(m[2]);
@@ -5254,6 +5412,9 @@
                                     const scanUrl = String(res.url || reqUrl || '');
                                     logReq(scanUrl);
                                     if (!config.showViewerCount) return;
+                                    /* v9.45：推荐流 / 榜单类的响应不扫 —— 里面装的是
+                                       一堆别的房间的人数，扫进来就是给打分喂噪声。 */
+                                    if (FEED_API_RE.test(scanUrl)) return;
                                     if (!COUNT_PRIO_RE.test(scanUrl) && !countScanBudget()) return;
                                     res.clone().text().then(function (t) {
                                         scanJsonForCount(t, 'fetch', null, scanUrl);
@@ -5286,6 +5447,7 @@
                             try {
                                 if (!config.showViewerCount) return;
                                 const u = String(self.__dyUrl || '');
+                                if (FEED_API_RE.test(u)) return;      // v9.45：推荐流不扫
                                 if (!COUNT_PRIO_RE.test(u) && !countScanBudget()) return;
                                 scanJsonForCount(self.responseText, 'xhr', null, u);
                             } catch (e) {}
@@ -5613,6 +5775,24 @@
         return out;
     }
 
+    /* v9.45：量级参照只认「人数条那个节点」本身。
+       上一版直接拿 findCountAnchors()[0]，而这个列表里混着顶栏上别的「x万」：
+       之前一次误写就把主播粉丝数（9.6万）、地点热度（3.1万）一起改写成了
+       人数，量级于是按那些节点算 —— 诊断里 scale:[134,837.5] 就是这么来的，
+       真实人数 2 万反而被判越界，显示锁死在 429。
+       现在优先取 [data-e2e="live-room-audience"]，取不到才退回列表首项。 */
+    function primaryCountEl() {
+        let list = document.querySelectorAll('[data-e2e="live-room-audience"]');
+        if (!list.length) list = document.querySelectorAll('[data-e2e*="audience"]');
+        for (const el of list) {
+            const raw = el.getAttribute('data-gm-orig-count');
+            const t = ((raw != null ? raw : (el.innerText || el.textContent || '')) + '')
+                .trim().replace(/[,\s]/g, '');
+            if (/^[\d.]+万\+?$/.test(t) || /^\d{2,9}\+?$/.test(t)) return el;
+        }
+        return null;
+    }
+
     /* 用页面自己显示的「1万」反推合理量级，防止把时间戳 / 礼物数 / 榜单数
        误当成在线人数；解析成功后缓存，避免 CSS 隐藏原文本后读不到。 */
     function displayedScale() {
@@ -5620,7 +5800,7 @@
         // v9.6：量级参照不再永久缓存。旧版 scaleCache 一旦算出就永不清空，
         // 页面模糊值从「1万」涨到「2万」后，新值全被判超出量级 → 数字冻结。
         if (scaleCache && now - scaleAt < 2000) return scaleCache;
-        const el = findCountAnchors()[0];
+        const el = primaryCountEl() || findCountAnchors()[0];
         if (!el) return null;
         let t = '';
         try {
@@ -5646,9 +5826,21 @@
         if (!hits || !hits.length) return null;
         const scale = displayedScale();
         const now = Date.now();
+        /* v9.45：有量级参照时先**硬过滤**，越界的候选一律不参与打分。
+           上一版是「越界只扣 100 分」，配上「新鲜的明确字段可以突破量级」
+           这条豁免，一个别的小房间的数字（429）就能赢过真实人数，
+           赢了之后还会 widenScale 把量级一起带偏 —— 之后越错越离谱。
+           现在：宁可这一拍不改，也不写一个明显不在量级里的数。 */
+        const pool = scale
+            ? hits.filter(h => h.value >= scale[0] && h.value <= scale[1])
+            : hits;
+        if (!pool.length) return null;
         const score = (h) => {
             let s = h.strong ? 100 : 20;
-            if (/display_value|display_long|room_view_stats/.test(h.key)) s += 70;
+            /* v9.45：room_view_stats 是「本房间」的在线统计，比泛泛的
+               display_value 可信得多，单独给一档更高的分。 */
+            if (h.key === 'room_view_stats') s += 130;
+            else if (/display_value|display_long/.test(h.key)) s += 70;
             else if (COUNT_KEY_RE.test(h.key)) s += 45;
             if (h.src.indexOf('fetch') === 0 || h.src.indexOf('xhr') === 0) s += 40;
             /* v9.6：新鲜度优先于数值大小；静态 SSR / 内联 script 只作兜底。
@@ -5662,13 +5854,12 @@
                 else s += 160;                   // 3.5~8s 的还能用，但压不过新的
             } else if (h.at) s -= 80;
             if (h.stale) s -= 140;
-            if (scale) s += (h.value >= scale[0] && h.value <= scale[1]) ? 150 : -100;
             if (h.value > 1e9) s -= 120;      // unix 秒 / 毫秒时间戳
             if (h.value < 20) s -= 120;       // 榜单、礼物等零星计数
             return s;
         };
         // 同分时取「更新的」而不是「更大的」，人数下降也能跟着变
-        const sorted = hits.slice().sort((a, b) =>
+        const sorted = pool.slice().sort((a, b) =>
             (score(b) - score(a)) || ((b.at || 0) - (a.at || 0)) || (b.value - a.value));
         if (!sorted.length) return null;
         const best = sorted[0];
@@ -5676,15 +5867,6 @@
            这时只认字段名明确的候选 —— 否则 AB 阈值、组件计数会被当成人数，
            显示出来就是「固定 1000」这种明显不对的数字。 */
         if (!scale && !COUNT_STRONG_KEY_RE.test(best.key)) return null;
-        if (scale && !(best.value >= scale[0] && best.value <= scale[1])) {
-            // 最近上报的明确字段允许突破旧量级（页面「1万」这类模糊值会滞后），
-            // 避免人数增长后被旧量级判死、显示永久停在旧数字。
-            if (!(best.fresh && /display_value|display_long|room_view_stats|user_count|total_user/.test(best.key)))
-                return null;
-        }
-        // 新的明确字段值反向校正量级，避免 DOM 的「1万」长期把人数卡死
-        if (best.fresh && /display_value|display_long|room_view_stats|user_count|total_user/.test(best.key))
-            widenScale(best.value);
         return best.value;
     }
 
@@ -5808,9 +5990,20 @@
             return document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false).nextNode();
         } catch (e) { return null; }
     }
-    /* v9.43：允许外部传入已算好的锚点，快通道里就不用再查一遍 DOM。 */
+    /* v9.43：允许外部传入已算好的锚点，快通道里就不用再查一遍 DOM。
+       v9.45：人数条本体（data-e2e="live-room-audience"）在的时候只改它一个。
+       顶栏上还有主播粉丝数 / 地点热度、右侧还有推荐位的观众数，它们同样是
+       「x万」短文本，之前会被 findCountAnchors 收进来一起改写 —— 显示看着就是
+       「一堆数字乱跳」，量级参照也跟着错。 */
     function applyCountText(text, anchors) {
-        const list = anchors || findCountAnchors();
+        let list = anchors || findCountAnchors();
+        const primary = document.querySelector('[data-e2e="live-room-audience"]');
+        if (primary) {
+            const pt = ((primary.textContent || '') + '').trim();
+            // 只有「它本来就装着一个短数值」时才独占，别把整块容器写成数字
+            if (primary.hasAttribute('data-gm-real-count') ||
+                (pt.length <= 14 && /^[\d.,]+\s*(万|w|W)?\+?$/.test(pt))) list = [primary];
+        }
         for (const el of list) {
             if (!el.isConnected) continue;
             if (!el.hasAttribute('data-gm-orig-count'))
@@ -5833,6 +6026,28 @@
             else el.textContent = orig;
         }
     }
+    /* v9.45：只还原「不是人数条本体」却被我们改过文案的节点。
+       旧版的顶栏补扫会把主播粉丝数（9.6万）、地点热度（3.1万）这些同样是
+       「x万」的短文本一起改成人数；节点上留着 data-gm-real-count，不还原
+       就会一直是错的数字，而且还会被 findCountAnchors 当锚点、把量级带偏。
+       人数条本体（live-room-audience）在的话才还原 —— 紧凑布局下可能就是
+       靠补扫写的那一个节点，那时不能动它。 */
+    function restoreStrayCountText() {
+        if (!document.querySelector('[data-e2e="live-room-audience"]')) return;
+        let dirty = false;
+        for (const el of document.querySelectorAll('[data-gm-real-count]')) {
+            if (el.matches('[data-e2e="live-room-audience"], [data-e2e*="audience"]')) continue;
+            const orig = el.getAttribute('data-gm-orig-count');
+            el.removeAttribute('data-gm-real-count');
+            el.removeAttribute('data-gm-orig-count');
+            dirty = true;
+            if (orig == null) continue;
+            const node = firstTextNode(el);
+            if (node) { if (node.nodeValue !== orig) node.nodeValue = orig; }
+            else el.textContent = orig;
+        }
+        if (dirty) countAnchorAt = 0;      // 锚点列表里有被清掉的节点，下一拍重新找
+    }
     function watchCountNodes() {
         if (!countObserver) {
             try {
@@ -5843,7 +6058,10 @@
                     // 量级校验因此把后来的新人数全部挡掉。只认带「万/+」的模糊值，
                     // 纯数字是我们自己写的精确值，不作参照。
                     let advanced = false;
-                    for (const el of findCountAnchors(true)) {
+                    /* v9.45：人数条本体在时只看它一个。顶栏别的「x万」被还原后
+                       也会有文本变化，跟着它们催轮询就是白跑。 */
+                    const primNow = document.querySelector('[data-e2e="live-room-audience"]');
+                    for (const el of (primNow ? [primNow] : findCountAnchors(true))) {
                         const cur = ((el.textContent || '') + '').trim();
                         if (cur && cur !== String(realCountCache) && /^[\d.]+(万\+?|\+)$/.test(cur)) {
                             el.setAttribute('data-gm-orig-count', cur);
@@ -5970,8 +6188,12 @@
         return findCountAnchors();
     }
 
-    /* 顶栏里还有别的「1.2万」短文本（不是人数条本身），一起改成精确值。 */
+    /* 顶栏里还有别的「1.2万」短文本（不是人数条本身），一起改成精确值。
+       v9.45：只在「找不到人数条本体」时才做这层补扫 —— 顶栏上还有主播粉丝数
+       （9.6万）、地点热度（3.1万）这些同样是「x万」的短文本，以前会被一起
+       改写成人数，显示出来就是一堆不该变的数字在乱跳，量级参照也被带偏。 */
     function paintTopCountText(text) {
+        if (document.querySelector('[data-e2e="live-room-audience"]')) return;
         const countRe = /^\d+(\.\d+)?万\+?$/;
         let found = 0;
         /* v9.19：先扫顶栏容器，别每轮全页过 4000 个文本节点。
@@ -6091,6 +6313,7 @@
             applyCountText(text);
             watchCountNodes();
             paintTopCountText(text);
+            restoreStrayCountText();               // v9.45：把误改的顶栏数字还回去
         }
     }
 
@@ -9439,6 +9662,7 @@
         fitSidebarHeight,
         restoreNativeSidebarWhenOff,
         syncSidebarHostState,
+        syncNavBg,                 // v9.45：侧栏底板跟着抖音容器底色走
         checkUrlChange,
         liftSidebarOverlays,
         closePausePopupTask,
@@ -9896,7 +10120,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.44</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.45</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

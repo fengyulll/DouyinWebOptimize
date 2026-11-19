@@ -30,14 +30,16 @@
     const initStyle = document.createElement('style');
     initStyle.id = 'gm-init-styles';
     initStyle.textContent = `
-        html, body { margin: 0 !important; padding: 0 !important; }
-        /* v9.45：页面底色全部交回给抖音自己的容器。
-           以前这里写死了三处：「html/body = #161616」「#root/#dark =
-           #161616（www）/ #000（live）」，用「补色块」的方式盖住悬浮侧栏
-           腾出来的那条缝。抖音改过一次配色之后，我们补的这块就和它自己的
-           底色对不上，缝反而变成一眼能看见的异色块。
-           现在一处都不写死：抖音的容器是什么色就让它自己铺什么色，
-           包括顶栏左边那条缝。我们只负责把搜索框摆到视口正中。 */
+        /* v9.46：页面底色不再写死 #161616，改成用 JS 从抖音自己的容器上读出来的
+           --gm-nav-bg（见 syncNavBg）。抖音换配色时它会跟着变，不会再出现
+           「补的色块和抖音不一样」。
+           这条不能整个删掉：直播页底部、顶栏左边这些地方本来就有几十像素是
+           抖音自己的容器没铺到的，靠它兜底；9.44/9.45 把它删干净之后，
+           底部就露出浏览器画布，看着就是一条空白带。 */
+        html, body {
+            background-color: var(--gm-nav-bg, #161616) !important;
+            margin: 0 !important; padding: 0 !important;
+        }
         [data-gm-popup-hidden], [data-gm-pause-hidden] { display: none !important; }
     `;
     html.appendChild(initStyle);
@@ -1648,17 +1650,19 @@
         }
     }
 
-    /* ---- 侧栏底板：读抖音自己容器的底色，不再写死 ----
-       v9.45：抖音换过一次配色之后，#161616 就它的底不再是同一个色了。
-       这里每次（最多 2s 一次）从页面自己那层容器上取当前底色，写进
-       CSS 变量 --gm-nav-bg，侧栏卡片跟着变，以后再换配色也不用改脚本。
+    /* ---- 页面底色 / 侧栏底板：读抖音自己容器的底色，不写死 ----
+       v9.45：抖音换过一次配色之后，#161616 和它的底不再是同一个色了。
+       v9.46：这个色现在同时给两处用 —— html/body 的兜底底色（直播页底部、
+              顶栏左边那几十像素抖音自己没铺到，靠它盖住）和侧栏卡片底板。
+       每次（最多 2s 一次）从页面自己那层容器上取当前底色，写进 CSS 变量
+       --gm-nav-bg，以后再换配色也不用改脚本。
        读取顺序：
          ① 侧栏根节点的祖先（往上 6 层）—— 抖音给侧栏铺的那层底，
             我们只改了根节点本身，祖先的底色还是抖音原样；
          ② #root / #dark / body / html —— 页面级容器；
-       只在「不透明 + 深色」时采用；全是透明或读不到就退回 #161616，
-       避免卡片突然变透明。（根节点自己不读：它的底色已经被我们改成
-       var(--gm-nav-bg)，读它等于读自己，会锁死在旧值上。） */
+       只在「不透明 + 深色」时采用；全是透明或读不到就退回 #161616。
+       （不读根节点自己：它的底色已经是 var(--gm-nav-bg)，读它等于读自己，
+       会锁死在旧值上；html/body 一旦被我们画上这个变量，也不再回头读它们。） */
     let navBgValue = '', navBgAt = 0;
     function readSurfaceColor() {
         const pick = (el) => {
@@ -1671,7 +1675,7 @@
             const a = p.length > 3 ? p[3] : 1;
             if (!(a >= 0.9)) return '';                 // 半透明不算「铺了底」
             const lum = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
-            if (lum > 150) return '';                   // 亮色底不算（侧栏是深色面板）
+            if (lum > 150) return '';                   // 亮色底不算（页面是深色）
             return 'rgb(' + (p[0] | 0) + ',' + (p[1] | 0) + ',' + (p[2] | 0) + ')';
         };
         let el = (sidebarRoot && sidebarRoot.isConnected) ? sidebarRoot.parentElement : null;
@@ -1682,13 +1686,15 @@
             el = el.parentElement;
         }
         for (const sel of ['#root', '#dark', 'body', 'html']) {
-            const c = pick(document.querySelector(sel));
+            const node = document.querySelector(sel);
+            /* 已经用这个变量画上底色了，再读 body/html 只会读回自己 */
+            if (navBgValue && (node === document.body || node === document.documentElement)) continue;
+            const c = pick(node);
             if (c) return c;
         }
         return '';
     }
     function syncNavBg() {
-        if (!sidebarEnabled()) return;
         const now = Date.now();
         if (now - navBgAt < 2000) return;               // getComputedStyle 不便宜，2s 一次够了
         navBgAt = now;
@@ -1697,6 +1703,11 @@
         navBgValue = val;
         try { html.style.setProperty('--gm-nav-bg', val); } catch (e) {}
     }
+    /* 尽早取一次：底部那条兜底色 / 侧栏底板都等不起第一个 1.5s 的循环 */
+    try {
+        document.addEventListener('DOMContentLoaded',
+            () => { try { syncNavBg(); } catch (e) {} }, { once: true });
+    } catch (e) {}
     updateSidebarFlag();
     lastSidebarState = sidebarEnabled() + '|' + sidebarSuppressed();
     ['fullscreenchange', 'webkitfullscreenchange'].forEach(ev => {

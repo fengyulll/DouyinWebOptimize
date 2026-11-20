@@ -3186,9 +3186,12 @@
             danmakuNote = 'label-hidden:' + label; return null;
         }
         const lcy = (lr.top + lr.bottom) / 2;
-        /* 像不像开关：比文案窄很多、在同一水平线上、整体在文案右侧 */
+        /* 像不像开关：比文案窄很多、在同一水平线上、整体在文案右侧。
+           v9.47：再排掉「带文字」的元素 —— 抖音这两个开关是纯图形 div，
+           同一行右侧如果有别的说明文字，宁可漏也不能把它当开关点。 */
         const usable = (el) => {
             if (!el || inOurPanel(el) || (used && used.has(el))) return false;
+            if ((el.textContent || '').trim()) return false;
             const r = rectOf(el);
             if (!r || r.width < 16 || r.width > 96 || r.height < 8 || r.height > 56) return false;
             if (Math.abs((r.top + r.bottom) / 2 - lcy) > 26) return false;
@@ -3196,22 +3199,28 @@
             return true;
         };
 
-        /* ① 行容器：从文案往上找第一个「高度 24~64、宽度明显大于文案」的块 */
-        let row = lab.parentElement, depth = 0;
-        while (row && depth++ < 6) {
-            const rr = rectOf(row);
-            if (rr && rr.height >= 24 && rr.height <= 64 && rr.width >= lr.width * 1.6) break;
-            row = row.parentElement;
-        }
+        /* ① 逐层往上试：文案的父级可能只是「文字那半截」的容器，
+              开关在外面一层（诊断实测：span 父 div.tvFMszYY 只有 4 个子元素、
+              不含开关；再外面那层 div 有 5 个、开关就在它右边）。
+              所以不能在第一层满足「像一行」时就停，要从近到远每一层都扫一遍，
+              取**最近的、且真的扫到开关**的那一层；一层里取最右的那个。 */
         let best = null;
-        if (row && depth <= 6) {
-            let rightEdge = -Infinity;
-            let kids;
-            try { kids = row.querySelectorAll('*'); } catch (e) { kids = []; }
-            for (const el of kids) {
-                if (!usable(el)) continue;
-                const r = rectOf(el);
-                if (r.right > rightEdge) { rightEdge = r.right; best = el; }
+        {
+            let cur = lab.parentElement, depth = 0;
+            while (cur && depth < 6) {
+                depth++;
+                const rr = rectOf(cur);
+                if (rr && rr.height > 160) break;      // 已经超出「一行」的范围
+                let found = null, rightEdge = -Infinity;
+                let kids;
+                try { kids = cur.querySelectorAll('*'); } catch (e) { kids = []; }
+                for (const el of kids) {
+                    if (!usable(el)) continue;
+                    const r = rectOf(el);
+                    if (r.right > rightEdge) { rightEdge = r.right; found = el; }
+                }
+                if (found) { best = found; break; }    // 最近一层命中就收工
+                cur = cur.parentElement;
             }
         }
         /* ② 兜底：全局找（行容器没认出来时） */

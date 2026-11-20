@@ -2,7 +2,7 @@
 
 把抖音网页版改成「能安静看视频」的样子 —— 悬浮侧边栏、画面净化、精准直播过滤、真实在线人数、画质与倍速增强，**所有功能都能单独开关**。
 
-当前版本 **9.48** · 许可证 MIT · 仅匹配 `www.douyin.com` 与 `live.douyin.com`
+当前版本 **9.49** · 许可证 MIT · 仅匹配 `www.douyin.com` 与 `live.douyin.com`
 
 ---
 
@@ -19,7 +19,7 @@
 
 ### 第 2 步：安装本脚本
 
-点这个链接 → [抖音网页版个人优化-9.48.user.js](https://raw.githubusercontent.com/fengyulll/DouyinWebOptimize/main/抖音网页版个人优化-9.48.user.js)
+点这个链接 → [抖音网页版个人优化-9.49.user.js](https://raw.githubusercontent.com/fengyulll/DouyinWebOptimize/main/抖音网页版个人优化-9.49.user.js)
 
 脚本管理器会弹出安装页面，点「安装」即可。
 

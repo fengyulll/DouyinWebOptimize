@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.48
+// @version      9.49
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -3162,28 +3162,67 @@
     }
     /* 只找文案本身，严格匹配，排除我们自己的设置面板。
        v9.47：优先返回**几何有效**（宽高都 > 0）的那个。
-       抖音的面板是 hover 才渲染的，页面里常常同时存在「已经卸载/隐藏的旧节点」，
-       旧逻辑返回第一个叶子，拿到的可能就是那个 rect 全 NaN/0 的残影 ——
-       后续按几何配对必然全部落空（诊断 trace 里的 rect=NaN 就是它）。 */
-    function findDanmakuLabelEl(label) {
-        const nodes = document.querySelectorAll('span, div, label');
-        let fallback = null, ghost = null;
-        for (let i = 0; i < nodes.length && i < 4000; i++) {
+       v9.49：两个真问题一起修 ——
+        ① 旧逻辑只扫文档前 4000 个节点。直播间 DOM 上万，弹幕面板排在很后面，
+           上限一截就把可见的那个挡掉，只剩页面前部挂着的**隐藏残影**，
+           于是永远判「文案几何无效」（诊断里的 label-hidden 就是它）。
+           诊断自己用 9000 的上限，所以诊断能扫到、脚本扫不到。
+        ② 旧逻辑扫不到可见节点时会把残影 return 出去，上层拿到几何无效直接
+           放弃本轮。现在**只返回真正可见的**，宁可返回 null 让上层重试。
+       另外：面板就弹在弹幕按钮附近，所以还按「离 icon 的距离」挑最近的那个，
+       避免聊天室里碰巧出现的同文案当标题。 */
+    let dmScanInfo = '';
+    let dmLabelEls = {};
+    let dmIcon = null;                    // v9.49：本轮用的弹幕按钮，配对时按它算距离
+    /* v9.49：一次 tick 只**遍历一遍**文档，两个文案一起取。
+       以前 gift / lucky 各扫一遍全文档（上万节点 ×2 ×150ms），明显挤占主线程。 */
+    function dmScanLabels(icon) {
+        const found = {};
+        const want = [];
+        for (const k in DANMAKU_LABEL) { want.push(DANMAKU_LABEL[k]); found[DANMAKU_LABEL[k]] = null; }
+        const bestD = {};
+        for (const w of want) bestD[w] = Infinity;
+        const ic = icon ? boxRect(icon) : null;
+        const icx = ic ? ic.left + ic.width / 2 : null;
+        const icy = ic ? ic.top + ic.height / 2 : null;
+        const geoOK = (r) => !!(r && isFinite(r.width) && isFinite(r.height) &&
+            r.width > 0 && r.height > 0);
+        let nodes, ghost = 0, far = 0;
+        try { nodes = document.querySelectorAll('span, div, label'); }
+        catch (e) { dmScanInfo = 'err'; dmLabelEls = found; return found; }
+        for (let i = 0; i < nodes.length; i++) {
             const el = nodes[i];
-            if (inOurPanel(el) || el.children.length > 2) continue;
+            if (el.children.length > 2) continue;
+            if (inOurPanel(el)) continue;
             const t = (el.textContent || '').trim();
-            if (!(t === label || (t.indexOf(label) >= 0 && t.length <= label.length + 2)))
-                continue;
-            if (el.children.length === 0) {
-                const r = boxRect(el);
-                if (r && isFinite(r.width) && isFinite(r.height) && r.width > 0 && r.height > 0)
-                    return el;                       // 真正显示着的那个
-                if (!ghost) ghost = el;
-                continue;
+            if (t.length < 2 || t.length > 12) continue;
+            let label = null;
+            for (const w of want) {
+                if (t === w || (t.indexOf(w) >= 0 && t.length <= w.length + 2)) { label = w; break; }
             }
-            if (!fallback) fallback = el;
+            if (!label) continue;
+            const r = boxRect(el);
+            if (!geoOK(r)) { ghost++; continue; }
+            let d = 0;
+            if (icx != null) {
+                const dx = r.left + r.width / 2 - icx;
+                const dy = r.top + r.height / 2 - icy;
+                /* 弹幕面板在按钮左上方向展开，窗口给足；再远的同文案不算 */
+                if (dx < -520 || dx > 240 || dy < -560 || dy > 160) { far++; continue; }
+                d = Math.abs(dx) + Math.abs(dy);
+            }
+            if (d < bestD[label]) { bestD[label] = d; found[label] = el; }
         }
-        return ghost || fallback;
+        dmScanInfo = 'nodes=' + nodes.length + ' ghost=' + ghost + ' far=' + far +
+            ' hit=' + want.map(w => (found[w] ? 'y' : 'n')).join('/');
+        dmLabelEls = found;
+        return found;
+    }
+    /* 单查一个文案（诊断用）。内部走同一套扫描，保证「诊断看到的」和
+       「后台轮询看到的」是同一个东西 —— 上次就是两边算法不一致才互相打脸。 */
+    function findDanmakuLabelEl(label, icon) {
+        dmScanLabels(icon);
+        return dmLabelEls[label] || null;
     }
     /* 按几何配对开关。诊断实测的结构（2026-11-20）：
          span 送礼信息      1199,1051, 48×20
@@ -3196,11 +3235,16 @@
        这么把唯一的候选过滤掉的）。
        每次调用都写 danmakuTrace，诊断里能直接看到每一层扫到了什么。 */
     let danmakuTrace = [];
-    function dmT(s) { if (danmakuTrace.length < 90) danmakuTrace.push(s); }
+    function dmT(s) {
+        danmakuTrace.push(s);
+        if (danmakuTrace.length > 180) danmakuTrace.shift();   // v9.49：留最近 180 行
+    }
     function findDanmakuSwitch(label, used) {
-        const lab = findDanmakuLabelEl(label);
+        const lab = (label in dmLabelEls) ? dmLabelEls[label]
+            : findDanmakuLabelEl(label, dmIcon);
         dmT('');
         dmT('## 找开关：' + label + '  (used=' + (used ? used.size : 0) + ')');
+        dmT('  扫描: ' + dmScanInfo);
         if (!lab) { danmakuNote = 'no-label:' + label; dmT('  文案没找到'); return null; }
         const lr = boxRect(lab);
         if (!lr || !isFinite(lr.width) || !isFinite(lr.height) ||
@@ -3413,16 +3457,75 @@
         danmakuCooldownUntil = 0;            // 别让 25s 冷却挡住重试
         danmakuNote = 'still-on:' + label + ' retry ' + danmakuRetry[key];
     }
+    /* v9.49：把「鼠标停在按钮上」这件事做得更像真的。
+       以前只调 props.onMouseEnter + 派发一次 mouseover，实测弹不出面板。
+       现在补 pointer 序列（有的版本监听 pointerover），并把 clientX/Y 定在按钮
+       中心 —— 抖音有些浮层是靠坐标判断该往哪边展开的。 */
+    function pointerSeqAt(el, type, x, y, bubbles) {
+        const base = {
+            bubbles: bubbles !== false, cancelable: true, view: window,
+            clientX: x, clientY: y, screenX: x, screenY: y
+        };
+        try {
+            if (typeof PointerEvent === 'function') {
+                const pe = new PointerEvent(type, Object.assign({
+                    pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: 0
+                }, base));
+                el.dispatchEvent(pe);
+                return;
+            }
+        } catch (e) {}
+        try {
+            el.dispatchEvent(new MouseEvent(type.replace(/^pointer/, 'mouse'), base));
+        } catch (e2) {}
+    }
     function openDanmakuPanel(icon, props) {
-        try { if (typeof props.onMouseEnter === 'function') props.onMouseEnter(); } catch (e) {}
+        const r = boxRect(icon);
+        const x = r ? r.left + r.width / 2 : 0;
+        const y = r ? r.top + r.height / 2 : 0;
+        /* v9.49：给 handler 一个像样的假事件。直接 onMouseEnter() 的话，
+           有的版本 handler 里读 e.currentTarget 会抛错，被 catch 吞掉，
+           看起来就是「调了却没反应」。 */
+        const fakeEv = {
+            type: 'mouseenter', target: icon, currentTarget: icon, relatedTarget: document.body,
+            clientX: x, clientY: y, pageX: x, pageY: y,
+            bubbles: false, cancelable: true, defaultPrevented: false,
+            nativeEvent: null, persist() {}, preventDefault() {}, stopPropagation() {},
+            isDefaultPrevented() { return false; }, isPropagationStopped() { return false; }
+        };
+        try { if (typeof props.onMouseEnter === 'function') props.onMouseEnter(fakeEv); } catch (e) {}
+        pointerSeqAt(icon, 'pointerover', x, y, true);
+        pointerSeqAt(icon, 'pointerenter', x, y, false);
         // React 的 onMouseEnter 由 mouseover 合成；只调 props 在部分版本不弹面板
         try {
             icon.dispatchEvent(new MouseEvent('mouseover', {
-                bubbles: true, cancelable: true, view: window, relatedTarget: document.body
+                bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
+                relatedTarget: document.body
             }));
         } catch (e) {}
-        try { icon.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, view: window })); }
-        catch (e) {}
+        try {
+            icon.dispatchEvent(new MouseEvent('mouseenter', {
+                bubbles: false, view: window, clientX: x, clientY: y
+            }));
+        } catch (e) {}
+        try {
+            icon.dispatchEvent(new MouseEvent('mousemove', {
+                bubbles: true, view: window, clientX: x, clientY: y
+            }));
+        } catch (e) {}
+    }
+    /* v9.49：面板打开后每拍补一次 mousemove。抖音有些浮层挂了全局 mousemove
+       监听，鼠标一旦「不在上面」就收起来 —— 我们合成 hover 之后浏览器真实
+       指针还停在设置面板上，很容易被它判成离开了。 */
+    function nudgeHover(icon) {
+        const r = boxRect(icon);
+        if (!r) return;
+        try {
+            icon.dispatchEvent(new MouseEvent('mousemove', {
+                bubbles: true, view: window,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2
+            }));
+        } catch (e) {}
     }
     function closeDanmakuPanel(icon, props) {
         try { if (typeof props.onMouseLeave === 'function') props.onMouseLeave(); } catch (e) {}
@@ -3466,6 +3569,7 @@
         }
         danmakuBusy = true; danmakuAttempts++;
         danmakuTrace = [];            // v9.47：每轮重新记录，诊断里看最近一轮
+        dmIcon = icon;                // v9.49：配对时按它算距离
         openDanmakuPanel(icon, props);
         const used = new Set();           // 每个开关本轮只归属一个文案
         let tries = 0;
@@ -3477,7 +3581,11 @@
             if (tries > 1 && tries % 3 === 0 &&
                 ((needLucky && !danmakuDone.lucky) || (needGift && !danmakuDone.gift))) {
                 openDanmakuPanel(icon, props);
+            } else {
+                nudgeHover(icon);     // v9.49：其余拍只补 mousemove，别把面板刷掉
             }
+            /* v9.49：每拍扫一遍文档，两个文案一起取（以前每拍扫两遍） */
+            dmScanLabels(icon);
             // 福袋口令先配对，避免被送礼信息抢走同行的开关
             if (needLucky && !danmakuDone.lucky) turnOffDanmaku('lucky', used);
             if (needGift && !danmakuDone.gift) turnOffDanmaku('gift', used);
@@ -5249,6 +5357,12 @@
               ' busy=' + danmakuBusy + ' attempts=' + danmakuAttempts +
               ' cooldownMs=' + Math.max(0, danmakuCooldownUntil - Date.now()) +
               ' note=' + danmakuNote);
+            /* v9.49：这一行是「脚本自己看到的世界」—— 后台轮询时扫了多少节点、
+               找到几个残影、几个在按钮附近、最后有没有命中。和下面手动抓到的
+               三段对照，就能分清是「面板根本没弹出来」还是「弹出来了但没扫到」。 */
+            p('script-scan: ' + (dmScanInfo || '(还没扫过)') +
+              ' | 脚本视角 labelGift=' + (findDanmakuLabelEl('送礼信息', icon) ? 'y' : 'n') +
+              ' labelLucky=' + (findDanmakuLabelEl('福袋口令', icon) ? 'y' : 'n'));
             p('');
 
             /* ① 文案：不限定层级，凡是文字里含这两个词的元素都列出来 */
@@ -5350,7 +5464,7 @@
         let waited = 0;
         const tick = () => {
             waited++;
-            const ready = !!findDanmakuLabelEl('送礼信息') || !!findDanmakuLabelEl('福袋口令');
+            const ready = !!findDanmakuLabelEl('送礼信息', icon) || !!findDanmakuLabelEl('福袋口令', icon);
             if (ready || waited > 15) { collect(); return; }
             setTimeout(tick, 400);
         };
@@ -5374,8 +5488,8 @@
              ' done=' + JSON.stringify(danmakuDone) + ' busy=' + danmakuBusy +
              ' attempts=' + danmakuAttempts +
              ' cooldownMs=' + Math.max(0, danmakuCooldownUntil - Date.now()) +
-             ' labelGift=' + !!findDanmakuLabelEl('送礼信息') +
-             ' labelLucky=' + !!findDanmakuLabelEl('福袋口令') +
+             ' labelGift=' + !!findDanmakuLabelEl('送礼信息', dIcon) +
+             ' labelLucky=' + !!findDanmakuLabelEl('福袋口令', dIcon) +
              ' switches=' + document.querySelectorAll(SWITCH_SEL).length +
              ' note=' + danmakuNote);
         push('max quality: done=' + qualityDone + ' currentUrl=' +
@@ -11022,7 +11136,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.48</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.49</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

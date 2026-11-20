@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.47
+// @version      9.48
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -3150,7 +3150,14 @@
     function inOurPanel(el) {
         return !!(el && el.closest && el.closest('#gm-settings-panel'));
     }
-    function rectOf(el) {
+    /* v9.48 关键修复：这个函数以前叫 rectOf，和布局诊断区（文件后半段）里的
+       rectOf 重名 —— 那个返回的是字符串 "left,top,w,h"。函数声明提升后后者
+       覆盖前者，于是弹幕逻辑拿到的 rect 是个字符串，lr.width 恒为 undefined，
+       isFinite(undefined)=false，每轮都直接判「文案几何无效」返回，
+       trace 里打出的正是 Math.round(undefined) 的 NaN,NaN,NaN,NaN。
+       表现就是「手动把菜单弹出来能关，让它自己找永远失败」。
+       改名 boxRect 返回真正的 DOMRect，两边彻底分开。 */
+    function boxRect(el) {
         try { return el.getBoundingClientRect(); } catch (e) { return null; }
     }
     /* 只找文案本身，严格匹配，排除我们自己的设置面板。
@@ -3168,7 +3175,7 @@
             if (!(t === label || (t.indexOf(label) >= 0 && t.length <= label.length + 2)))
                 continue;
             if (el.children.length === 0) {
-                const r = rectOf(el);
+                const r = boxRect(el);
                 if (r && isFinite(r.width) && isFinite(r.height) && r.width > 0 && r.height > 0)
                     return el;                       // 真正显示着的那个
                 if (!ghost) ghost = el;
@@ -3195,7 +3202,7 @@
         dmT('');
         dmT('## 找开关：' + label + '  (used=' + (used ? used.size : 0) + ')');
         if (!lab) { danmakuNote = 'no-label:' + label; dmT('  文案没找到'); return null; }
-        const lr = rectOf(lab);
+        const lr = boxRect(lab);
         if (!lr || !isFinite(lr.width) || !isFinite(lr.height) ||
             (lr.width === 0 && lr.height === 0)) {
             danmakuNote = 'label-hidden:' + label;
@@ -3209,7 +3216,7 @@
         /* 像不像开关：尺寸像、在同一水平线、整体在文案右侧 */
         const usable = (el) => {
             if (!el || inOurPanel(el) || (used && used.has(el))) return false;
-            const r = rectOf(el);
+            const r = boxRect(el);
             if (!r || r.width < 16 || r.width > 96 || r.height < 8 || r.height > 56) return false;
             if (Math.abs((r.top + r.bottom) / 2 - lcy) > 26) return false;
             if (r.left < lr.right - 8) return false;
@@ -3220,7 +3227,7 @@
             let cur = lab.parentElement, depth = 0;
             while (cur && depth < 8) {
                 depth++;
-                const rr = rectOf(cur);
+                const rr = boxRect(cur);
                 if (rr && rr.height > 600) {
                     dmT('  L' + depth + ' 高 ' + Math.round(rr.height) + ' 已超出面板范围，停');
                     break;
@@ -3230,7 +3237,7 @@
                 try { kids = cur.querySelectorAll('*'); } catch (e) { kids = []; }
                 for (const el of kids) {
                     if (!usable(el)) continue;
-                    const r = rectOf(el);
+                    const r = boxRect(el);
                     cands.push({ el: el, right: r.right, txt: (el.textContent || '').trim().length });
                 }
                 dmT('  L' + depth + ' <' + cur.tagName.toLowerCase() + '> class="' +
@@ -3253,7 +3260,7 @@
             for (let i = 0; i < switches.length && i < 300; i++) {
                 const sw = switches[i];
                 if (inOurPanel(sw) || (used && used.has(sw))) continue;
-                const r = rectOf(sw);
+                const r = boxRect(sw);
                 if (!r || r.width < 14 || r.width > 90 || r.height < 8 || r.height > 56) continue;
                 const dy = Math.abs((r.top + r.bottom) / 2 - lcy);
                 if (dy > 20 || r.left < lr.left - 10) continue;
@@ -3270,7 +3277,7 @@
                 const c = all[i];
                 if (inOurPanel(c) || (used && used.has(c))) continue;
                 if ((c.textContent || '').trim()) continue;
-                const r = rectOf(c);
+                const r = boxRect(c);
                 if (!r || r.width < 18 || r.width > 80 || r.height < 10 || r.height > 46) continue;
                 const dy = Math.abs((r.top + r.bottom) / 2 - lcy);
                 if (dy > 20) continue;
@@ -11015,7 +11022,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.47</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.48</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

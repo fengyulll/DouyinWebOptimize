@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.50
+// @version      9.51
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -2185,10 +2185,55 @@
         '[data-e2e*="avatar"], [data-e2e*="user"], [data-e2e*="author"], ' +
         '[data-e2e*="profile"], [data-e2e*="nickname"], [data-e2e*="account"], ' +
         '[class*="avatar"], [class*="Avatar"], [class*="nickname"], [class*="Nickname"]';
+    /* v9.51b：除了头像/链接，凡是「自己本来就有交互」的东西一律放行 ——
+       按钮、输入框、菜单项、卡片、标签页。中键在这些地方本来就有别的用途，
+       不该被我们抢去开关聊天室。 */
+    const MIDDLE_EXTRA_SEL = 'button, input, textarea, select, label, ' +
+        '[contenteditable=""], [contenteditable="true"], ' +
+        '[data-e2e*="button"], [data-e2e*="menu"], [data-e2e*="item"], ' +
+        '[data-e2e*="card"], [data-e2e*="tab"], [data-e2e*="link"], ' +
+        '[role="button"], [role="menuitem"], [role="tab"]';
 
+    /* v9.51b：主播头像就在播放器左上角，class 全是哈希，上面那串选择器
+       一个都命不中，于是被当成「画面空白」去切聊天室了。
+       这里加两条与 class 无关的判据：
+         ① **圆形小块** —— 头像一定是圆的（border-radius 50% 或接近半宽），
+            播放器画面/覆盖层的圆角是 0，不会误伤；
+         ② **fiber 上带用户身份** —— userId / sec_uid / nickname 这类字段。
+       命中任意一条就当成「这里有自己的用途」，放行给浏览器。 */
+    function looksLikeUserChip(el) {
+        let cur = el, d = 0;
+        while (cur && d++ < 5) {
+            if (!(cur instanceof Element)) break;
+            const r = cur.getBoundingClientRect();
+            /* 头像常常就是一张 <img>，圆角在父级身上 */
+            if (cur.tagName === 'IMG' && r.width >= 20 && r.width <= 100) return true;
+            if (r.width >= 20 && r.width <= 100 && Math.abs(r.width - r.height) <= 6) {
+                let br = '';
+                try { br = window.getComputedStyle(cur).borderRadius || ''; } catch (e) {}
+                const px = parseFloat(br);
+                if (/50%/.test(br) || (isFinite(px) && px >= r.width * 0.4)) return true;
+            }
+            cur = cur.parentElement;
+        }
+        let f = null;
+        try { f = dyReactFiber(el); } catch (e) {}
+        let k = 0;
+        while (f && k++ < 3) {                // 只往上 3 层，再往上就是整个直播间了
+            const pr = f.memoizedProps;
+            /* 只认明确的用户身份字段。userInfo 这种在直播间容器层也有，
+               用它判断会把整个画面都放行，中键就再也切不了聊天室。 */
+            if (pr && (pr.userId || pr.user_id || pr.sec_uid || pr.secUid ||
+                (typeof pr.nickname === 'string' && pr.nickname))) return true;
+            f = f.return;
+        }
+        return false;
+    }
     function middleShouldPass(target) {
         if (!(target instanceof Element)) return false;
         if (target.closest(MIDDLE_PASS_SEL)) return true;
+        if (target.closest(MIDDLE_EXTRA_SEL)) return true;
+        if (looksLikeUserChip(target)) return true;
         /* 兜底：沿祖先链看有没有「像用户主页」的链接/属性，
            最多 6 层，避免把整个视频区域都算进去。 */
         let cur = target, d = 0;
@@ -2204,12 +2249,44 @@
         return false;
     }
 
+    /* v9.51：直播间里「中键 = 开关聊天室」以前是**无条件**的 —— 只要不在那串
+       头像/链接选择器里，一律 preventDefault 掉。可抖音直播间的推荐位、标题、
+       频道栏大量是 div + JS 路由，middleShouldPass 认不全，结果就是「哪个位置
+       都开不了新标签」。
+       现在改成：只有中键落在**播放器画面**上才切聊天室，其余位置一律放行，
+       交给浏览器原生开新标签。 */
+    function isLivePlayerSurface(target) {
+        if (!(target instanceof Element)) return false;
+        const v = mainLiveVideo();
+        if (!v) return false;                 // 播放器还没出来：宁可放行，别误吞
+        /* 用落点判断，不要用 contains 沿祖先链上溯 —— 那样到 body 一定成立，
+           等于「全页面都是播放器」。就认「这一点的中心落在 video 的矩形里」。 */
+        let r = null;
+        try { r = v.getBoundingClientRect(); } catch (e) { return false; }
+        if (!r || r.width < 40 || r.height < 40) return false;
+        let t = null;
+        try { t = target.getBoundingClientRect(); } catch (e) { return false; }
+        if (!t) return false;
+        const cx = t.left + t.width / 2, cy = t.top + t.height / 2;
+        const inVideo = cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+        if (!inVideo) return false;
+        /* 画面里的控制条、按钮、链接：那是「能点的东西」，放行。
+           这里只能用精确选择器 —— 上一版写了 [class*="controls"]，
+           结果播放器外层容器就带这个词，整个画面被当成控制条，中键全废。 */
+        if (target.closest('.douyin-player-controls')) return false;
+        if (target.closest('button, a[href], [role="button"], [role="link"]')) return false;
+        return true;
+    }
     function handleMiddleClick(e) {
         if (!config.enableGestures) return;
         const now = Date.now();
         if (now - lastMiddleAction < 300) return;   // mousedown / auxclick 双通道去重
         if (e.target instanceof Element && e.target.closest(panelIgnore)) return;
-        if (middleShouldPass(e.target)) return;     // 让浏览器按原生行为开新标签
+        if (middleShouldPass(e.target)) return;   // 交还浏览器：中键后台开新标签
+        if (isLivePage()) {
+            /* v9.51：画面以外全部放行（以前这里是无条件切聊天室） */
+            if (!isLivePlayerSurface(e.target)) return;
+        }
         lastMiddleAction = now;
         e.preventDefault(); e.stopImmediatePropagation();
         if (isLivePage()) {
@@ -2645,13 +2722,26 @@
     const POPUP_TRIGGER_RE = /点亮展馆|集星|助力主播|展馆|福袋|口令|抽奖|去送礼|送出了|送出|赠送|送给主播|点亮.*灯牌|加入.*粉丝团|\d+\s*s[^，。]{0,6}去送礼|去送礼[^\d]{0,4}\d+\s*s/;
     const POPUP_SKIP_SELECTOR = '.douyin-player-controls, .xgplayer-controls, ' +
         '[class*="danmaku"], [class*="barrage"], [class*="bullet"], ' +
-        '[class*="chatroom"], [class*="chat-room"], [data-e2e*="chatroom"], #gm-settings-panel';
+        '[class*="chatroom"], [class*="chat-room"], [data-e2e*="chatroom"], ' +
+        '[class*="user-card"], [class*="userCard"], [class*="UserCard"], ' +
+        '[class*="profileCard"], [data-e2e*="user-card"], [data-e2e*="profile"], ' +
+        '#gm-settings-panel';
     const POPUP_SETTING_RE = /弹幕|设置|画质|清晰度|音量|倍速|全屏|分享|举报|反馈/;
     /* 「福袋 / 口令 / 抽奖」单独出现时**不是**推广浮窗：直播间的抢福袋入口、
        倒计时图标都带这些字，它们是有用功能，被当成浮窗隐藏就表现为
        「抢福袋的按钮/图标消失了」。只有同时带送礼/展馆类词时才可能是推广。 */
     const PROMO_STRONG_RE = /点亮展馆|集星|助力主播|展馆|去送礼|送出了|赠送|送给主播|灯牌|粉丝团/;
     const LUCKY_WORD_RE = /福袋/;
+    /* v9.51b：聊天室里点别人昵称弹出的「用户名片」也算 absolute 浮层，而且
+       里面常带「加入粉丝团」「送出礼物」这类字，被推广规则一起隐藏了。
+       这些是名片独有的动作词（推广浮窗不会同时出现「发消息 / 私信 / 个人资料」）。 */
+    const USER_CARD_RE = new RegExp([
+        '发消息', '私信', '个人资料', 'TA的作品', '查看主页', '@TA',
+        /* 名片上那行「509 关注 · 40 粉丝」，这个组合推广浮窗不会有 */
+        '\\d+\\s*万?\\s*关注\\s*·', '·\\s*\\d+\\s*万?\\s*粉丝',
+        /* 名片底部那两块「粉丝团 / 会员 未开通」 */
+        '粉丝团[\\s\\S]{0,24}会员', '会员[\\s\\S]{0,24}未开通'
+    ].join('|'));
     const DIALOG_TEXT_SEL = 'input, textarea, [role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"]';
 
     /* v9.37.1 福袋硬保护：只要文本里出现「福袋」，又没有明确的送礼/展馆动作词，
@@ -2668,6 +2758,8 @@
     function isPromoPopup(el) {
         const t = (el.textContent || '').trim().slice(0, 160);
         if (!t || t.length > 140 || !POPUP_TRIGGER_RE.test(t)) return false;
+        /* v9.51b：用户名片放过（聊天室点昵称弹出来的那个） */
+        if (USER_CARD_RE.test(t)) return false;
         // 弹幕设置 / 画质设置浮层必须放过（v9.1 一闪而过的问题）
         if (POPUP_SETTING_RE.test(t)) return false;
         /* 带「福袋」且无送礼强词 → 直接放过（抢福袋入口 / 倒计时 / 进度条） */
@@ -3569,14 +3661,53 @@
             }));
         } catch (e) {}
     }
+    /* 找到承载「送礼信息 / 福袋口令」的那个浮层容器（往上找高度 > 80 的那层） */
+    function danmakuPanelBox(icon) {
+        try { dmScanLabels(icon); } catch (e) { return null; }
+        for (const k in DANMAKU_LABEL) {
+            const el = dmLabelEls[DANMAKU_LABEL[k]];
+            if (!el) continue;
+            let cur = el.parentElement, d = 0;
+            while (cur && d++ < 7) {
+                const r = boxRect(cur);
+                if (r && r.height > 80 && r.width > 120) return cur;
+                cur = cur.parentElement;
+            }
+        }
+        return null;
+    }
+    function dmLeave(el) {
+        if (!el || !el.dispatchEvent) return;
+        try {
+            el.dispatchEvent(new MouseEvent('mouseleave', {
+                bubbles: false, cancelable: true, view: window, relatedTarget: document.body
+            }));
+        } catch (e) {}
+        try {
+            el.dispatchEvent(new MouseEvent('mouseout', {
+                bubbles: true, cancelable: true, view: window, relatedTarget: document.body
+            }));
+        } catch (e) {}
+    }
     function closeDanmakuPanel(icon, props) {
         try { if (typeof props.onMouseLeave === 'function') props.onMouseLeave(); } catch (e) {}
-        try {
-            icon.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
-            icon.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }));
-            if (icon.parentElement)
-                icon.parentElement.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
-        } catch (e) {}
+        dmLeave(icon);
+        if (icon.parentElement) dmLeave(icon.parentElement);
+        /* v9.51b：光让「按钮」认为指针离开还不够 —— 真正开着的是那个设置浮层，
+           它自己也在监听 hover。这里把浮层容器一起补上；400ms 后如果文字还在
+           屏幕上，就再补一次（抖音的关闭有动画延迟，一次不一定够）。 */
+        const box = danmakuPanelBox(icon);
+        if (box) dmLeave(box);
+        setTimeout(() => {
+            try {
+                dmScanLabels(icon);
+                if (!dmLabelEls[DANMAKU_LABEL.gift] && !dmLabelEls[DANMAKU_LABEL.lucky]) return;
+                const b2 = danmakuPanelBox(icon);
+                if (b2) dmLeave(b2);
+                dmLeave(icon);
+                if (typeof props.onMouseLeave === 'function') props.onMouseLeave();
+            } catch (e) {}
+        }, 400);
     }
     function applyDanmakuSettings() {
         if (!isLivePage() || danmakuBusy) return;
@@ -3615,7 +3746,7 @@
         dmIcon = icon;                // v9.49：配对时按它算距离
         openDanmakuPanel(icon, props);
         const used = new Set();           // 每个开关本轮只归属一个文案
-        let tries = 0;
+        let tries = 0, doneAt = 0;
         const timer = setInterval(() => {
             tries++;
             /* v9.50 关键：**先看面板在不在，再决定要不要补扇**。
@@ -3653,7 +3784,12 @@
                 if (danmakuDone.lucky && !danmakuVerified.lucky && !verifyOne('lucky')) settled = false;
             }
             const allDone = !nGift && !nLucky;
-            if ((allDone && settled) || tries > 60) {
+            if (allDone && !doneAt) doneAt = tries;
+            /* v9.51b：两项都点完以后最多再等 8 拍（1.2 秒）就收工。
+               以前要等复查给出结论，状态读不出来时会一路等到 tries>60，
+               于是面板在屏幕上挂着将近 9 秒 —— 就是你说的「消失得很慢」。 */
+            const waitedTooLong = allDone && doneAt > 0 && tries - doneAt >= 8;
+            if ((allDone && settled) || waitedTooLong || tries > 60) {
                 clearInterval(timer);
                 closeDanmakuPanel(icon, props);
                 danmakuBusy = false;
@@ -3918,11 +4054,15 @@
             if (atBest) {
                 qualityDone = true;
                 qualityNote = 'xgplayer best is "' + curTxt + '"';
+                /* 菜单是被我们悬停叫出来的，收工时也得把它收回去 */
+                setTimeout(() => { try { closePlayerMenus(); } catch (e) {} }, 200);
                 return 'max';
             }
             activateMenuRow(best.el, 'full');
             qualityNote = 'xgplayer click "' + best.text + '"';
             xgClarityClicked++;
+            /* 等 React 处理完这次点击再收菜单，太早会把点击一起吞掉 */
+            setTimeout(() => { try { closePlayerMenus(); } catch (e) {} }, 280);
             return 'clicked';
         }
         /* 列表没开：先把菜单悬停唤出来，隔 420ms 再回来读一次 ——
@@ -3997,6 +4137,35 @@
     }
     /* 弹出的画质菜单项：必须有 absolute/fixed 浮层祖先，且同层有多项。
        这样控制栏上那个「当前画质」标签永远不会被当成菜单项。 */
+    /* v9.51b：画质/清晰度菜单是 hover 型的。脚本悬停把它叫出来、点完档位之后
+       没有把「指针离开」补齐，抖音就一直认为鼠标还停在按钮上，菜单挂在屏幕上
+       好几秒 —— 就是「画质菜单消失得很慢」。这里主动补一遍离开动作。 */
+    function closePlayerMenus() {
+        const targets = [];
+        try { for (const el of qualityAnchorEls()) targets.push(el); } catch (e) {}
+        try {
+            const ctl = controlQualityEl();
+            if (ctl) {
+                let cur = ctl.parentElement, d = 0;
+                while (cur && d++ < 4) { targets.push(cur); cur = cur.parentElement; }
+            }
+        } catch (e) {}
+        try { for (const el of qualityPlayerRoots()) targets.push(el); } catch (e) {}
+        for (const el of targets) {
+            if (!el || !el.dispatchEvent) continue;
+            try {
+                el.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false, view: window }));
+                el.dispatchEvent(new MouseEvent('mouseout', {
+                    bubbles: true, cancelable: true, view: window, relatedTarget: document.body
+                }));
+            } catch (e) {}
+        }
+        try {
+            document.body.dispatchEvent(new MouseEvent('mouseover', {
+                bubbles: true, cancelable: true, view: window, relatedTarget: document.body
+            }));
+        } catch (e) {}
+    }
     function qualityMenuItems() {
         const out = [];
         const nodes = document.querySelectorAll('div, span, li, p, button');
@@ -4333,6 +4502,7 @@
             if (curLv && liveLevelOf(best.text) === curLv) {
                 qualityDone = true;
                 qualityNote = 'best available = ' + best.text;
+                setTimeout(() => { try { closePlayerMenus(); } catch (e) {} }, 200);
                 return;
             }
             /* 点完要尽快复查「现在是不是目标档」：爆发期也留 1.2 秒，
@@ -4346,6 +4516,7 @@
                 }
             }
             qualityNote = 'clicked menu item "' + best.text + '" (try ' + qualityDomTries + ')';
+            setTimeout(() => { try { closePlayerMenus(); } catch (e) {} }, 280);
             /* 不在这里置 qualityDone：下一轮用 ① 复查当前档位，
                没切过去就继续重试。 */
             return;
@@ -6237,6 +6408,69 @@
        这里先收带标记的短数字叶子，没有时再按「顶栏短数字」兜底找，
        并做 800ms 缓存避免每轮全量扫文本节点。 */
     let countAnchorCache = [], countAnchorAt = 0;
+
+    /* v9.51：这个节点现在**真的显示在屏幕上**吗。
+       关闭聊天室后抖音不会删掉 live-room-audience 那个 div，只是把它挪走/隐藏，
+       右上角另外渲染一个「5w」。旧逻辑「只要 data-e2e 在就只改它一个」，
+       于是精确值全写进了那个看不见的节点，屏幕上那个 5w 永远不动。 */
+    function countElShown(el) {
+        if (!el || !el.isConnected || el.nodeType !== 1) return false;
+        let r = null;
+        try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+        if (!r || r.width < 2 || r.height < 2) return false;
+        if (r.bottom <= 0 || r.right <= 0) return false;
+        if (r.top >= window.innerHeight || r.left >= window.innerWidth) return false;
+        try {
+            const cs = window.getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+        } catch (e) {}
+        return true;
+    }
+    function visibleCountPrimary() {
+        const list = document.querySelectorAll(
+            '[data-e2e="live-room-audience"], [data-e2e*="audience"]');
+        for (const el of list) if (countElShown(el)) return el;
+        return null;
+    }
+
+    /* v9.51b：按坐标探测右上角那一个数字。
+       为什么不能用 TreeWalker：直播间文本节点几千个（光聊天室就上千条），
+       按文档顺序扫到的人数是「左上角的第 6000 个节点」，右上角那个根本轮不到。
+       这里直接从右上角几个点做命中测试，命中的元素 + 它的直接父级都验一遍。 */
+    function probeTopRightCount() {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        if (!vw || !vh) return null;
+        const xs = [], ys = [];
+        for (let i = 1; i <= 7; i++) xs.push(vw - i * 34);
+        for (let j = 1; j <= 8; j++) ys.push(j * 24);
+        const seen = new Set();
+        for (const y of ys) {
+            for (const x of xs) {
+                let els = null;
+                try { els = document.elementsFromPoint(x, y); } catch (e) { continue; }
+                if (!els) continue;
+                for (const el of els) {
+                    if (!el || el.nodeType !== 1 || seen.has(el)) continue;
+                    seen.add(el);
+                    if (el.closest && el.closest('#gm-settings-panel')) continue;
+                    const cands = [el, el.parentElement];
+                    for (const c of cands) {
+                        if (!c || c.nodeType !== 1) continue;
+                        if (c.hasAttribute && c.hasAttribute('data-gm-real-count')) continue;
+                        const t = ((c.textContent || '') + '').trim();
+                        if (!t || t.length > 14) continue;
+                        if (!/^\d[\d.,]*(\.\d+)?\s*(万|w|W|亿|[kK])?\+?$/.test(t)) continue;
+                        /* 「100+」「10+」是榜单/礼物计数，不是人数 */
+                        if (/^\d{1,4}\+$/.test(t)) continue;
+                        if (!countElShown(c)) continue;
+                        return c;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     function findCountAnchors(force) {
         const now = Date.now();
         if (!force && now - countAnchorAt < 800) return countAnchorCache;
@@ -6246,28 +6480,77 @@
             if (!el || el.nodeType !== 1 || !el.isConnected || seen.has(el)) return;
             seen.add(el); out.push(el);
         };
+        const marked = [];
         for (const el of document.querySelectorAll(
             '[data-e2e="live-room-audience"], [data-e2e*="audience"], [data-gm-real-count]')) {
             const t = ((el.textContent || '') + '').trim();
             // 只收「1万 / 21146」这类短数字叶子，别把整个观众列表容器改掉
             if (el.hasAttribute('data-gm-real-count') ||
-                (t.length <= 14 && !/[\u4e00-\u9fa5]{2,}/.test(t))) add(el);
+                (t.length <= 14 && !/[\u4e00-\u9fa5]{2,}/.test(t))) marked.push(el);
         }
-        if (!out.length && document.body) {
-            walkText(document.body, 2000, (node) => {
+        /* v9.51：可见的排前面。关闭聊天室后带 data-e2e 的那个 div 还在 DOM 里
+           但已经不可见，真正显示「5w」的是另一个节点 —— 不排一下序，锚点永远
+           指向看不见的那个。 */
+        marked.sort((a, b) => (countElShown(b) ? 1 : 0) - (countElShown(a) ? 1 : 0));
+        for (const el of marked) add(el);
+        /* v9.51：以前只有「一个标记节点都没有」时才补扫。可关了聊天室以后标记
+           节点还在（只是看不见），于是永远走不到这段，右上角那个 5w 从来没被
+           收进来过。现在改成「标记节点里没有一个可见的」就补扫。
+           另外正则补上 w/W/k/K/亿 —— 紧凑布局显示的是 5w 不是 5万。 */
+        /* v9.51b：条件从「一个可见锚点都没有」放宽成「还没有哪个可见锚点
+           正在显示模糊值」。关掉聊天室后抖音会在右上角另渲染一个「5万」，
+           它既不是 data-e2e 节点、也没进过锚点表 —— 不主动扫一遍，
+           精确值就永远只写进那个看不见的老节点里。 */
+        /* 判断标准：屏幕上已经有「可见 + 显示精确数字」的锚点了吗。
+           有就不必再全量扫（每一轮都扫 6000 个文本节点太浪费）；
+           没有才扫 —— 关聊天室那一刻正好是「有一点可见锚点、但显示的还是 5万」。 */
+        const hasShownPrecise = out.some((el) => {
+            if (!countElShown(el)) return false;
+            const t = ((el.textContent || '') + '').trim();
+            return /^\d{3,8}(,\d{3})*\+?$/.test(t);
+        });
+        if (!hasShownPrecise && document.body) {
+            /* ① 先按坐标探测右上角（最准，不受文档顺序影响） */
+            const probed = probeTopRightCount();
+            if (probed) add(probed);
+            /* ② 再按文本扫顶栏，最后才全页 */
+            let hits = 0;
+            const scanNode = (node) => {
                 const t = (node.nodeValue || '').trim();
-                if (!/^\d{3,8}(,\d{3})*\+?$/.test(t) && !/^\d+(\.\d+)?万\+?$/.test(t)) return;
+                if (!/^\d{3,8}(,\d{3})*\+?$/.test(t) &&
+                    !/^\d+(\.\d+)?\s*(万|w|W|亿)\+?$/.test(t) &&
+                    !/^\d+(\.\d+)?\s*[kK]\+?$/.test(t)) return;
                 const p = node.parentElement;
-                if (!p || p.hasAttribute('data-e2e') || p.closest('#gm-settings-panel')) return;
+                /* v9.51：不再因为「带 data-e2e」就跳过 —— 紧凑布局那个 5w 节点
+                   自己就带 data-e2e，只是不含 audience。靠长度 + 位置把关就够。 */
+                if (!p || p.closest('#gm-settings-panel') || p.hasAttribute('data-gm-real-count')) return;
                 if (((p.textContent || '') + '').trim().length > 14) return;
+                /* v9.51b：100+ / 10+ 是榜单和礼物计数，不是在线人数。
+                   上一版把它们当成人数改了（诊断里 x=1090 那三个 Xx4sWoWH）。 */
+                if (/^\d{1,4}\+$/.test(t)) return;
                 const r = p.getBoundingClientRect();
-                if (!r.width || r.width > 160 || r.top < 0 || r.top > 160) return;
+                /* v9.51b：顶栏高度放到 200 —— 直播间顶栏实测会超过 160，
+                   卡在 160 时人数条直接被判「不在顶栏」漏掉。 */
+                if (!r.width || r.width > 180 || r.top < 0 || r.top > 200) return;
                 const up = p.parentElement, gp = up && up.parentElement;
                 const ctx = String((up && up.className) || '') + ' ' +
                             String((gp && gp.className) || '');
-                if (!/audience|online|user|viewer|count|room|header|top|rank/i.test(ctx)) return;
+                if (!/audience|online|user|viewer|count|room|header|top|rank/i.test(ctx)) {
+                    /* v9.51：紧凑布局下 class 全是哈希，关键词一个都命中不了。
+                       退一步按位置认：顶栏右侧、贴着视口右边的小块短数字。 */
+                    /* 只认「贴着右边」的：0.8 而不是 0.55 —— 0.55 会把舞台右侧
+                       那排榜单数字（x≈1090）也算进来。 */
+                    const nearTopRight = r.top < 160 && r.right > window.innerWidth * 0.8;
+                    if (!nearTopRight) return;
+                }
+                hits++;
                 add(p);
-            });
+            };
+            const topRoot = document.querySelector(
+                '#douyin-header, [id^="douyin-header"], [data-e2e*="header"], [class*="header"]');
+            if (topRoot) walkText(topRoot, 2000, scanNode);
+            /* 顶栏没扫到、坐标也没探到，才扫全页 */
+            if (!hits && !probed) walkText(document.body, 6000, scanNode);
         }
         countAnchorCache = out;
         return out;
@@ -6308,9 +6591,17 @@
                 .trim().replace(/[,\s]/g, '');
         } catch (e) {}
         let lo = 0, hi = 0;
-        if (/^[\d.]+万/.test(t)) {
+        /* v9.51：紧凑布局下抖音写的是 5w / 12k，旧正则只认中文「万」，
+           量级反推直接失效（返回 null），后面打分就没有量级约束了。 */
+        if (/^[\d.]+\s*(万|w|W)/.test(t)) {
             const w = parseFloat(t) * 10000;
             lo = Math.max(1, w * 0.4); hi = w * 2.5;
+        } else if (/^[\d.]+\s*亿/.test(t)) {
+            const y = parseFloat(t) * 1e8;
+            lo = Math.max(1, y * 0.4); hi = y * 2.5;
+        } else if (/^[\d.]+\s*[kK]/.test(t)) {
+            const k = parseFloat(t) * 1000;
+            lo = Math.max(1, k * 0.4); hi = k * 2.5;
         } else if (/^\d{2,9}\+?$/.test(t)) {
             const n = parseInt(t, 10);
             lo = n * 0.5; hi = n * 2;
@@ -6415,8 +6706,17 @@
         push('time: ' + new Date().toISOString());
         const anchors = findCountAnchors(true);
         const el = anchors[0];
+        /* v9.51：每个锚点标出「可见 / 不可见」和它的矩形 —— 关闭聊天室后
+           到底是哪个节点在被改、哪个在显示，这一行直接看出来。 */
         push('anchors (' + anchors.length + '): ' + anchors.slice(0, 4)
-            .map(a => (a.outerHTML || '').slice(0, 220)).join(' || '));
+            .map(a => {
+                let r = null;
+                try { r = a.getBoundingClientRect(); } catch (e) {}
+                const box = r ? [r.left, r.top, r.width, r.height].map(n => Math.round(n)).join(',') : '?';
+                return (countElShown(a) ? '[显示] ' : '[隐藏] ') + box + ' ' +
+                    (a.outerHTML || '').slice(0, 150);
+            }).join(' || '));
+        push('visible primary: ' + (visibleCountPrimary() ? 'yes' : 'no'));
         push('anchor: ' + (el ? (el.outerHTML || '').slice(0, 800) : 'NOT FOUND'));
         push('anchor text: ' + (el ? ((el.innerText || el.textContent || '') + '').trim() : '-'));
         push('scale: ' + JSON.stringify(displayedScale()));
@@ -6495,15 +6795,35 @@
        「一堆数字乱跳」，量级参照也跟着错。 */
     function applyCountText(text, anchors) {
         let list = anchors || findCountAnchors();
-        const primary = document.querySelector('[data-e2e="live-room-audience"]');
+        /* v9.51：只有**看得见的**人数条本体才独占。关闭聊天室后抖音把那个 div
+           留在 DOM 里但挪走/隐藏，右上角另外渲染一个「5w」；旧逻辑见 data-e2e
+           就独占，精确值全写进看不见的那个，屏幕上永远停在 5w。 */
+        const primary = visibleCountPrimary();
+        /* v9.51b：不再「只改一个」。关掉聊天室后抖音在右上角另起一个「5万」，
+           它跟 data-e2e 那个节点是**两个**可见节点，只改一个就会出现
+           「属性里已经是 51952、屏幕上还是 5万」。这里把「可见的、长得像人数条」
+           的全部改掉，上限 3 个，别把顶栏别的数字也带上。 */
+        const targets = [];
         if (primary) {
             const pt = ((primary.textContent || '') + '').trim();
-            // 只有「它本来就装着一个短数值」时才独占，别把整块容器写成数字
             if (primary.hasAttribute('data-gm-real-count') ||
-                (pt.length <= 14 && /^[\d.,]+\s*(万|w|W)?\+?$/.test(pt))) list = [primary];
+                (pt.length <= 14 && /^[\d.,]+\s*(万|w|W)?\+?$/.test(pt))) targets.push(primary);
         }
         for (const el of list) {
+            if (targets.length >= 3) break;
+            if (el === primary || targets.indexOf(el) >= 0) continue;
+            if (!countElShown(el)) continue;
+            const t = ((el.textContent || '') + '').trim();
+            if (t.length > 14) continue;
+            if (!/^[\d.,]+\s*(万|w|W|[kK]|亿)?\+?$/.test(t)) continue;
+            if (/^\d{1,4}\+$/.test(t)) continue;   // 榜单的 100+ / 10+，不是人数
+            targets.push(el);
+        }
+        if (targets.length) list = targets;
+        for (const el of list) {
             if (!el.isConnected) continue;
+            /* 标记「这是我们正在用的锚点」，restoreStrayCountText 别把它还回去 */
+            try { el.setAttribute('data-gm-count-anchor', '1'); } catch (e) {}
             if (!el.hasAttribute('data-gm-orig-count'))
                 el.setAttribute('data-gm-orig-count', (el.textContent || '').trim());
             if (el.getAttribute('data-gm-real-count') !== text)
@@ -6518,6 +6838,7 @@
             const orig = el.getAttribute('data-gm-orig-count');
             el.removeAttribute('data-gm-real-count');
             el.removeAttribute('data-gm-orig-count');
+            el.removeAttribute('data-gm-count-anchor');
             if (orig == null) continue;
             const node = firstTextNode(el);
             if (node) node.nodeValue = orig;
@@ -6535,9 +6856,18 @@
         let dirty = false;
         for (const el of document.querySelectorAll('[data-gm-real-count]')) {
             if (el.matches('[data-e2e="live-room-audience"], [data-e2e*="audience"]')) continue;
+            /* v9.51：紧凑布局下真正在用的那个「5w」节点没有 audience 标记，
+               以前会被这里当成「误改的顶栏数字」还原掉，白改一场。 */
+            if (el.hasAttribute('data-gm-count-anchor')) {
+                /* 还在当前锚点表里、且真的看得见 → 这是我们正在用的，别动；
+                   否则说明是上一轮误收进来的（比如榜单的 100+），清标记走还原 */
+                if (countAnchorCache.indexOf(el) >= 0 && countElShown(el)) continue;
+                el.removeAttribute('data-gm-count-anchor');
+            }
             const orig = el.getAttribute('data-gm-orig-count');
             el.removeAttribute('data-gm-real-count');
             el.removeAttribute('data-gm-orig-count');
+            el.removeAttribute('data-gm-count-anchor');
             dirty = true;
             if (orig == null) continue;
             const node = firstTextNode(el);
@@ -6558,7 +6888,7 @@
                     let advanced = false;
                     /* v9.45：人数条本体在时只看它一个。顶栏别的「x万」被还原后
                        也会有文本变化，跟着它们催轮询就是白跑。 */
-                    const primNow = document.querySelector('[data-e2e="live-room-audience"]');
+                    const primNow = visibleCountPrimary();
                     for (const el of (primNow ? [primNow] : findCountAnchors(true))) {
                         const cur = ((el.textContent || '') + '').trim();
                         if (cur && cur !== String(realCountCache) && /^[\d.]+(万\+?|\+)$/.test(cur)) {
@@ -6691,8 +7021,9 @@
        （9.6万）、地点热度（3.1万）这些同样是「x万」的短文本，以前会被一起
        改写成人数，显示出来就是一堆不该变的数字在乱跳，量级参照也被带偏。 */
     function paintTopCountText(text) {
-        if (document.querySelector('[data-e2e="live-room-audience"]')) return;
-        const countRe = /^\d+(\.\d+)?万\+?$/;
+        /* v9.51：见 data-e2e 就 return 是不对的 —— 关掉聊天室后它还在，只是看不见 */
+        if (visibleCountPrimary()) return;
+        const countRe = /^\d+(\.\d+)?\s*(万|w|W|亿|[kK])\+?$/;
         let found = 0;
         /* v9.19：先扫顶栏容器，别每轮全页过 4000 个文本节点。
            顶栏找不到（改版/全屏）再退回 body。 */
@@ -11200,7 +11531,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.50</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.51</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

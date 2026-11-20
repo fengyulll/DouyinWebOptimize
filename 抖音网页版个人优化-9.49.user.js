@@ -3317,7 +3317,9 @@
         if (!best) {
             let bestScore = Infinity;
             const all = document.querySelectorAll('div, span, button, label, i');
-            for (let i = 0; i < all.length && i < 4000; i++) {
+            /* v9.49：这个上限以前是 4000，和「找文案」踩的是同一个坑 ——
+               直播间 DOM 上万，面板里的节点排在后面就被截掉了。放到 20000。 */
+            for (let i = 0; i < all.length && i < 20000; i++) {
                 const c = all[i];
                 if (inOurPanel(c) || (used && used.has(c))) continue;
                 if ((c.textContent || '').trim()) continue;

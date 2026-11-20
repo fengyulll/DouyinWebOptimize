@@ -3153,21 +3153,30 @@
     function rectOf(el) {
         try { return el.getBoundingClientRect(); } catch (e) { return null; }
     }
-    /* 只找文案本身，严格匹配，排除我们自己的设置面板。 */
+    /* 只找文案本身，严格匹配，排除我们自己的设置面板。
+       v9.47：优先返回**几何有效**（宽高都 > 0）的那个。
+       抖音的面板是 hover 才渲染的，页面里常常同时存在「已经卸载/隐藏的旧节点」，
+       旧逻辑返回第一个叶子，拿到的可能就是那个 rect 全 NaN/0 的残影 ——
+       后续按几何配对必然全部落空（诊断 trace 里的 rect=NaN 就是它）。 */
     function findDanmakuLabelEl(label) {
         const nodes = document.querySelectorAll('span, div, label');
-        let fallback = null;
-        for (let i = 0; i < nodes.length && i < 3000; i++) {
+        let fallback = null, ghost = null;
+        for (let i = 0; i < nodes.length && i < 4000; i++) {
             const el = nodes[i];
             if (inOurPanel(el) || el.children.length > 2) continue;
             const t = (el.textContent || '').trim();
             if (!(t === label || (t.indexOf(label) >= 0 && t.length <= label.length + 2)))
                 continue;
-            // 父容器的 textContent 往往也是同一个词，但叶子节点几何最准
-            if (el.children.length === 0) return el;
+            if (el.children.length === 0) {
+                const r = rectOf(el);
+                if (r && isFinite(r.width) && isFinite(r.height) && r.width > 0 && r.height > 0)
+                    return el;                       // 真正显示着的那个
+                if (!ghost) ghost = el;
+                continue;
+            }
             if (!fallback) fallback = el;
         }
-        return fallback;
+        return ghost || fallback;
     }
     /* 按几何配对开关。诊断实测的结构（2026-11-20）：
          span 送礼信息      1199,1051, 48×20
@@ -3187,8 +3196,11 @@
         dmT('## 找开关：' + label + '  (used=' + (used ? used.size : 0) + ')');
         if (!lab) { danmakuNote = 'no-label:' + label; dmT('  文案没找到'); return null; }
         const lr = rectOf(lab);
-        if (!lr || (lr.width === 0 && lr.height === 0)) {
-            danmakuNote = 'label-hidden:' + label; dmT('  文案被隐藏 rect=0'); return null;
+        if (!lr || !isFinite(lr.width) || !isFinite(lr.height) ||
+            (lr.width === 0 && lr.height === 0)) {
+            danmakuNote = 'label-hidden:' + label;
+            dmT('  文案几何无效 rect=' + (lr ? [lr.left, lr.top, lr.width, lr.height].map(n => Math.round(n)).join(',') : 'null'));
+            return null;
         }
         const lcy = (lr.top + lr.bottom) / 2;
         dmT('  文案 <' + lab.tagName.toLowerCase() + '> rect=' +
@@ -3452,11 +3464,18 @@
         let tries = 0;
         const timer = setInterval(() => {
             tries++;
+            /* v9.47：面板是 hover 才渲染的，合成 hover 一次不一定弹得出来
+               （用户实测：手动hover能关，让它自己开就关不掉）。
+               所以每 3 拍补扇一次，保证整个重试窗口里面板是活的。 */
+            if (tries > 1 && tries % 3 === 0 &&
+                ((needLucky && !danmakuDone.lucky) || (needGift && !danmakuDone.gift))) {
+                openDanmakuPanel(icon, props);
+            }
             // 福袋口令先配对，避免被送礼信息抢走同行的开关
             if (needLucky && !danmakuDone.lucky) turnOffDanmaku('lucky', used);
             if (needGift && !danmakuDone.gift) turnOffDanmaku('gift', used);
             const done = (!needGift || danmakuDone.gift) && (!needLucky || danmakuDone.lucky);
-            if (done || tries > 24) {
+            if (done || tries > 40) {
                 clearInterval(timer);
                 closeDanmakuPanel(icon, props);
                 danmakuBusy = false;

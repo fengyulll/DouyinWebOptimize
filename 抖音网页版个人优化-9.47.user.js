@@ -3169,61 +3169,72 @@
         }
         return fallback;
     }
-    /* 按几何配对开关。v9.47 诊断实测的结构：
-         文案 <span class="FTgH60Qj"> rect=1299,920,48,20
-         行容器 <div class="tvFMszYY"> rect=1299,912,222,36
-         开关     <div class="">            rect=1491,921,30,18   ← 两个哈希 class 的 div，
-                                                                    既没有 role=switch，
-                                                                    也不是 checkbox
-       所以「先找行容器、再取容器里最右那个像开关的」比全局扫描稳：
-       行容器把范围限死在一行内，不会跨行抢到相邻开关。
-       全局扫描保留作兜底（行容器结构再变时还能用）。 */
+    /* 按几何配对开关。诊断实测的结构（2026-11-20）：
+         span 送礼信息      1199,1051, 48×20
+         div.tvFMszYY       1199,1043,222×36   ← 4 个后代，只有文字
+         div (无 class)     1199,1043,222×36   ← 5 个后代，开关在这一层
+         开关 div           1391,1052, 30×18   ← 两个哈希 class，没有 role=switch
+       所以：从文案父级开始逐层往上，每层都扫一遍，最近一层扫到就用它；
+       层内「无文字的优先，其次取最右」。**不再按 textContent 硬排除** ——
+       抖音这个开关里可能塞了隐藏文本，硬排除会让整个匹配落空（上一版就是
+       这么把唯一的候选过滤掉的）。
+       每次调用都写 danmakuTrace，诊断里能直接看到每一层扫到了什么。 */
+    let danmakuTrace = [];
+    function dmT(s) { if (danmakuTrace.length < 90) danmakuTrace.push(s); }
     function findDanmakuSwitch(label, used) {
         const lab = findDanmakuLabelEl(label);
-        if (!lab) { danmakuNote = 'no-label:' + label; return null; }
+        dmT('');
+        dmT('## 找开关：' + label + '  (used=' + (used ? used.size : 0) + ')');
+        if (!lab) { danmakuNote = 'no-label:' + label; dmT('  文案没找到'); return null; }
         const lr = rectOf(lab);
         if (!lr || (lr.width === 0 && lr.height === 0)) {
-            danmakuNote = 'label-hidden:' + label; return null;
+            danmakuNote = 'label-hidden:' + label; dmT('  文案被隐藏 rect=0'); return null;
         }
         const lcy = (lr.top + lr.bottom) / 2;
-        /* 像不像开关：比文案窄很多、在同一水平线上、整体在文案右侧。
-           v9.47：再排掉「带文字」的元素 —— 抖音这两个开关是纯图形 div，
-           同一行右侧如果有别的说明文字，宁可漏也不能把它当开关点。 */
+        dmT('  文案 <' + lab.tagName.toLowerCase() + '> rect=' +
+            [lr.left, lr.top, lr.width, lr.height].map(n => Math.round(n)).join(',') +
+            ' | right=' + Math.round(lr.right) + ' lcy=' + Math.round(lcy));
+        /* 像不像开关：尺寸像、在同一水平线、整体在文案右侧 */
         const usable = (el) => {
             if (!el || inOurPanel(el) || (used && used.has(el))) return false;
-            if ((el.textContent || '').trim()) return false;
             const r = rectOf(el);
             if (!r || r.width < 16 || r.width > 96 || r.height < 8 || r.height > 56) return false;
             if (Math.abs((r.top + r.bottom) / 2 - lcy) > 26) return false;
             if (r.left < lr.right - 8) return false;
             return true;
         };
-
-        /* ① 逐层往上试：文案的父级可能只是「文字那半截」的容器，
-              开关在外面一层（诊断实测：span 父 div.tvFMszYY 只有 4 个子元素、
-              不含开关；再外面那层 div 有 5 个、开关就在它右边）。
-              所以不能在第一层满足「像一行」时就停，要从近到远每一层都扫一遍，
-              取**最近的、且真的扫到开关**的那一层；一层里取最右的那个。 */
         let best = null;
         {
             let cur = lab.parentElement, depth = 0;
-            while (cur && depth < 6) {
+            while (cur && depth < 8) {
                 depth++;
                 const rr = rectOf(cur);
-                if (rr && rr.height > 160) break;      // 已经超出「一行」的范围
-                let found = null, rightEdge = -Infinity;
+                if (rr && rr.height > 600) {
+                    dmT('  L' + depth + ' 高 ' + Math.round(rr.height) + ' 已超出面板范围，停');
+                    break;
+                }
+                const cands = [];
                 let kids;
                 try { kids = cur.querySelectorAll('*'); } catch (e) { kids = []; }
                 for (const el of kids) {
                     if (!usable(el)) continue;
                     const r = rectOf(el);
-                    if (r.right > rightEdge) { rightEdge = r.right; found = el; }
+                    cands.push({ el: el, right: r.right, txt: (el.textContent || '').trim().length });
                 }
-                if (found) { best = found; break; }    // 最近一层命中就收工
+                dmT('  L' + depth + ' <' + cur.tagName.toLowerCase() + '> class="' +
+                    String(cur.className || '').slice(0, 22) + '" rect=' +
+                    (rr ? [rr.left, rr.top, rr.width, rr.height].map(n => Math.round(n)).join(',') : '?') +
+                    ' | 后代' + kids.length + ' 候选' + cands.length);
+                if (cands.length) {
+                    cands.sort((a, b) => (a.txt - b.txt) || (b.right - a.right));
+                    best = cands[0].el;
+                    dmT('    → 选中 right=' + Math.round(cands[0].right) + ' txt=' + cands[0].txt);
+                    break;
+                }
                 cur = cur.parentElement;
             }
         }
-        /* ② 兜底：全局找（行容器没认出来时） */
+        /* 兜底一：按 SWITCH_SEL 找（真实开关语义的那些） */
         if (!best) {
             let bestScore = Infinity;
             const switches = document.querySelectorAll(SWITCH_SEL);
@@ -3237,7 +3248,9 @@
                 const score = dy + Math.max(0, r.left - lr.left) * 0.06;
                 if (score < bestScore) { bestScore = score; best = sw; }
             }
+            if (best) dmT('  兜底(SWITCH_SEL) 命中');
         }
+        /* 兜底二：全文档无文本小方块 */
         if (!best) {
             let bestScore = Infinity;
             const all = document.querySelectorAll('div, span, button, label, i');
@@ -3254,8 +3267,10 @@
                 const score = dy + Math.abs(dx) * 0.08;
                 if (score < bestScore) { bestScore = score; best = c; }
             }
+            if (best) dmT('  兜底(全文档无文本块) 命中');
         }
         danmakuNote = best ? 'sw-found:' + label : 'no-switch:' + label;
+        dmT('  结果: ' + danmakuNote);
         return best;
     }
     /* 抖音开关开启态是红色 #fe2c55，关闭态是深灰。fiber / aria / class
@@ -3431,6 +3446,7 @@
             danmakuNote = 'no-props'; return;
         }
         danmakuBusy = true; danmakuAttempts++;
+        danmakuTrace = [];            // v9.47：每轮重新记录，诊断里看最近一轮
         openDanmakuPanel(icon, props);
         const used = new Set();           // 每个开关本轮只归属一个文案
         let tries = 0;
@@ -5290,6 +5306,12 @@
                   ' bg=' + bg(sw) + ' checked=' + String(h.checked) + ' explicit=' + h.explicit);
             }
             if (!shown) p('  (一个都没命中)');
+            p('');
+
+            /* ④ 配对过程 trace：每层扫到了几个候选、最后选中哪个 */
+            p('## 配对过程（最近一轮）');
+            if (!danmakuTrace.length) p('  (还没跑过：把「关掉福袋口令与送礼信息弹幕」打开，进直播间等一下)');
+            else for (const line of danmakuTrace) p(line);
             p('');
             p('# 说明：note 显示 no-label / no-switch / unknown-state / weak-off 时，');
             p('#       对照上面三段就能知道是「文案没找到」「右侧没候选」还是「状态读不出」。');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.46
+// @version      9.47
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -30,7 +30,7 @@
     const initStyle = document.createElement('style');
     initStyle.id = 'gm-init-styles';
     initStyle.textContent = `
-        /* v9.46：页面底色不再写死 #161616，改成用 JS 从抖音自己的容器上读出来的
+        /* v9.47：页面底色不再写死 #161616，改成用 JS 从抖音自己的容器上读出来的
            --gm-nav-bg（见 syncNavBg）。抖音换配色时它会跟着变，不会再出现
            「补的色块和抖音不一样」。
            这条不能整个删掉：直播页底部、顶栏左边这些地方本来就有几十像素是
@@ -719,10 +719,26 @@
                     display: none !important;
                 }
             `);
+            /* v9.47：这两条「连外壳一起藏」的规则删掉了。
+               `.douyin-player-controls > div:has([data-e2e="gifts-container"])`
+               会匹配到控制条自己的直接子块，命中后整块 display:none ——
+               诊断里那个「后代 210 个、有尺寸 0 个」的空壳就是这么来的。
+               gifts-container 本身已经被上一条藏掉了，外壳留着不占视觉，
+               占位由下面的操作栏折叠处理，不需要连坐。 */
+            /* v9.47：抖音改版后给「全窗口播放」在底部留了一条操作栏的高度
+               （实测 88px，里面装礼物栏）。我们把礼物栏藏掉，这条高度却还在，
+               控制条就一直停在「离底 88px」的位置。
+               这里在**样式层**先把它压成 0：样式从 document-start 就生效，
+               抖音挂载时量到的高度就是 0，控制条一开始就排在窗口底部，
+               不会再沿用那个旧值（JS 的 collapseEmptyOpBar 只作兜底）。
+               限定 .__playerIsFull：常规直播间那条栏里还装着评论输入框，不能动。 */
             css.push(`
-                [data-e2e="living-container"] div:has(> div > [data-e2e="gifts-container"]),
-                .douyin-player-controls > div:has([data-e2e="gifts-container"]) {
-                    display: none !important;
+                html.xydy-live .__playerIsFull div[class*="OperatingBarPluginContainer"] {
+                    height: 0 !important;
+                    min-height: 0 !important;
+                    max-height: 0 !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
                 }
             `);
         }
@@ -1652,7 +1668,7 @@
 
     /* ---- 页面底色 / 侧栏底板：读抖音自己容器的底色，不写死 ----
        v9.45：抖音换过一次配色之后，#161616 和它的底不再是同一个色了。
-       v9.46：这个色现在同时给两处用 —— html/body 的兜底底色（直播页底部、
+       v9.47：这个色现在同时给两处用 —— html/body 的兜底底色（直播页底部、
               顶栏左边那几十像素抖音自己没铺到，靠它盖住）和侧栏卡片底板。
        每次（最多 2s 一次）从页面自己那层容器上取当前底色，写进 CSS 变量
        --gm-nav-bg，以后再换配色也不用改脚本。
@@ -1705,8 +1721,15 @@
     }
     /* 尽早取一次：底部那条兜底色 / 侧栏底板都等不起第一个 1.5s 的循环 */
     try {
-        document.addEventListener('DOMContentLoaded',
-            () => { try { syncNavBg(); } catch (e) {} }, { once: true });
+        document.addEventListener('DOMContentLoaded', () => {
+            try { syncNavBg(); } catch (e) {}
+            /* 底部操作栏别等第一个 1.5s 循环：它一占位播放器就矮 88px，
+               等一会儿再收会看到画面「往上跳」一下。 */
+            try { setTimeout(() => safeRun(collapseEmptyOpBar), 600); } catch (e) {}
+            try { setTimeout(() => safeRun(collapseEmptyOpBar), 2000); } catch (e) {}
+            /* 以前误接管的控制条，进来先还原一次 */
+            try { setTimeout(() => safeRun(restoreControlBar), 800); } catch (e) {}
+        }, { once: true });
     } catch (e) {}
     updateSidebarFlag();
     lastSidebarState = sidebarEnabled() + '|' + sidebarSuppressed();
@@ -3146,10 +3169,15 @@
         }
         return fallback;
     }
-    /* 按几何配对开关，不再依赖父链 / 兄弟层级：诊断显示抖音面板里文案
-       span 的祖先全是 48x20 小容器，整行容器可能高 >100 或超过 7 层，
-       nextElementSibling 和「向上找整行」都会落空。
-       规则：开关在文案右侧、中心 y 差 < 44px、尺寸像开关，取最近的一个。 */
+    /* 按几何配对开关。v9.47 诊断实测的结构：
+         文案 <span class="FTgH60Qj"> rect=1299,920,48,20
+         行容器 <div class="tvFMszYY"> rect=1299,912,222,36
+         开关     <div class="">            rect=1491,921,30,18   ← 两个哈希 class 的 div，
+                                                                    既没有 role=switch，
+                                                                    也不是 checkbox
+       所以「先找行容器、再取容器里最右那个像开关的」比全局扫描稳：
+       行容器把范围限死在一行内，不会跨行抢到相邻开关。
+       全局扫描保留作兜底（行容器结构再变时还能用）。 */
     function findDanmakuSwitch(label, used) {
         const lab = findDanmakuLabelEl(label);
         if (!lab) { danmakuNote = 'no-label:' + label; return null; }
@@ -3158,29 +3186,58 @@
             danmakuNote = 'label-hidden:' + label; return null;
         }
         const lcy = (lr.top + lr.bottom) / 2;
-        const switches = document.querySelectorAll(SWITCH_SEL);
-        let best = null, bestScore = Infinity;
-        for (let i = 0; i < switches.length && i < 300; i++) {
-            const sw = switches[i];
-            if (inOurPanel(sw) || (used && used.has(sw))) continue;
-            const r = rectOf(sw);
-            if (!r || r.width < 14 || r.width > 90 || r.height < 8 || r.height > 56) continue;
-            // 必须与文案在同一行；44px 阈值会跨行抢到相邻开关
-            if (r.bottom < lr.top - 8 || r.top > lr.bottom + 8) continue;
-            const dy = Math.abs((r.top + r.bottom) / 2 - lcy);
-            if (dy > 20 || r.left < lr.left - 10) continue;
-            const score = dy + Math.max(0, r.left - lr.left) * 0.06;
-            if (score < bestScore) { bestScore = score; best = sw; }
+        /* 像不像开关：比文案窄很多、在同一水平线上、整体在文案右侧 */
+        const usable = (el) => {
+            if (!el || inOurPanel(el) || (used && used.has(el))) return false;
+            const r = rectOf(el);
+            if (!r || r.width < 16 || r.width > 96 || r.height < 8 || r.height > 56) return false;
+            if (Math.abs((r.top + r.bottom) / 2 - lcy) > 26) return false;
+            if (r.left < lr.right - 8) return false;
+            return true;
+        };
+
+        /* ① 行容器：从文案往上找第一个「高度 24~64、宽度明显大于文案」的块 */
+        let row = lab.parentElement, depth = 0;
+        while (row && depth++ < 6) {
+            const rr = rectOf(row);
+            if (rr && rr.height >= 24 && rr.height <= 64 && rr.width >= lr.width * 1.6) break;
+            row = row.parentElement;
+        }
+        let best = null;
+        if (row && depth <= 6) {
+            let rightEdge = -Infinity;
+            let kids;
+            try { kids = row.querySelectorAll('*'); } catch (e) { kids = []; }
+            for (const el of kids) {
+                if (!usable(el)) continue;
+                const r = rectOf(el);
+                if (r.right > rightEdge) { rightEdge = r.right; best = el; }
+            }
+        }
+        /* ② 兜底：全局找（行容器没认出来时） */
+        if (!best) {
+            let bestScore = Infinity;
+            const switches = document.querySelectorAll(SWITCH_SEL);
+            for (let i = 0; i < switches.length && i < 300; i++) {
+                const sw = switches[i];
+                if (inOurPanel(sw) || (used && used.has(sw))) continue;
+                const r = rectOf(sw);
+                if (!r || r.width < 14 || r.width > 90 || r.height < 8 || r.height > 56) continue;
+                const dy = Math.abs((r.top + r.bottom) / 2 - lcy);
+                if (dy > 20 || r.left < lr.left - 10) continue;
+                const score = dy + Math.max(0, r.left - lr.left) * 0.06;
+                if (score < bestScore) { bestScore = score; best = sw; }
+            }
         }
         if (!best) {
+            let bestScore = Infinity;
             const all = document.querySelectorAll('div, span, button, label, i');
-            for (let i = 0; i < all.length && i < 2500; i++) {
+            for (let i = 0; i < all.length && i < 4000; i++) {
                 const c = all[i];
                 if (inOurPanel(c) || (used && used.has(c))) continue;
                 if ((c.textContent || '').trim()) continue;
                 const r = rectOf(c);
-                if (!r || r.width < 20 || r.width > 76 || r.height < 10 || r.height > 46) continue;
-                if (r.bottom < lr.top - 8 || r.top > lr.bottom + 8) continue;
+                if (!r || r.width < 18 || r.width > 80 || r.height < 10 || r.height > 46) continue;
                 const dy = Math.abs((r.top + r.bottom) / 2 - lcy);
                 if (dy > 20) continue;
                 const dx = r.left - lr.right;
@@ -3250,6 +3307,13 @@
         try { el.click(); } catch (e2) {}
         return true;
     }
+    /* v9.47：点完必须复查。
+       抖音这两个开关是「两个哈希 class 的 div」，fiber 上能拿到的 onClick 有可能是
+       整行容器的（点了只展开、不切换），所以「点了没关」这种事只能靠结果判断：
+       点完记时间，600ms 后重新读一次 checked，还是 true 就放开标记重点，
+       最多 3 次，第二次改用 fiber 的 onClick。 */
+    const danmakuClickAt = { gift: 0, lucky: 0 };
+    const danmakuRetry = { gift: 0, lucky: 0 };
     function turnOffDanmaku(key, used) {
         const label = DANMAKU_LABEL[key];
         const sw = findDanmakuSwitch(label, used);
@@ -3268,16 +3332,43 @@
             danmakuDone[key] = true; danmakuNote = 'already-off:' + label; return true;
         }
         if (h.checked !== true) { danmakuNote = 'unknown-state:' + label; return false; }
-        if (h.onClick) {
+        /* 第一次用真实点击（走 React 事件系统，命中的就是开关自己）；
+           复查发现没关掉时才改用 fiber 上的 onClick 再来一次。 */
+        if (danmakuRetry[key] > 0 && h.onClick) {
             try {
-                h.onClick(); danmakuDone[key] = true;
-                danmakuNote = 'fiber-click:' + label; return true;
+                h.onClick();
+                danmakuDone[key] = true; danmakuClickAt[key] = Date.now();
+                danmakuNote = 'fiber-click:' + label;
+                return true;
             } catch (e) { danmakuNote = 'fiber-throw:' + label; }
         }
         dyFireClick(sw);
         danmakuDone[key] = true;
+        danmakuClickAt[key] = Date.now();
         danmakuNote = 'dom-click:' + label;
         return true;
+    }
+    /* 复查：上一次点击已经把 done 置真，但开关实际还开着 → 打回重试 */
+    function verifyDanmakuOff(key) {
+        if (!danmakuDone[key] || !danmakuClickAt[key]) return;
+        if (Date.now() - danmakuClickAt[key] < 600) return;
+        const label = DANMAKU_LABEL[key];
+        const keep = danmakuNote;            // findDanmakuSwitch 会写 note，别污染
+        const sw = findDanmakuSwitch(label, null);
+        if (!sw) { danmakuNote = keep; return; }
+        const h = dyCheckboxHandler(sw);
+        if (h.checked !== true) { danmakuNote = keep; return; }   // 读不出 / 已关完事
+        if (danmakuRetry[key] >= 4) {
+            /* 反复点了还是开着：放弃本轮，别再每隔 1.5s 把面板弹出来烦人。
+               换直播间（URL 变）会自动重置。 */
+            danmakuDone[key] = true;
+            danmakuNote = 'give-up:' + label;
+            return;
+        }
+        danmakuDone[key] = false;
+        danmakuRetry[key]++;
+        danmakuCooldownUntil = 0;            // 别让 25s 冷却挡住重试
+        danmakuNote = 'still-on:' + label + ' retry ' + danmakuRetry[key];
     }
     function openDanmakuPanel(icon, props) {
         try { if (typeof props.onMouseEnter === 'function') props.onMouseEnter(); } catch (e) {}
@@ -3309,16 +3400,21 @@
             danmakuDone.gift = false; danmakuDone.lucky = false;
             danmakuAttempts = 0; danmakuCooldownUntil = 0; danmakuNote = 'idle';
             danmakuWeak.gift = 0; danmakuWeak.lucky = 0;
+            danmakuRetry.gift = 0; danmakuRetry.lucky = 0;
+            danmakuClickAt.gift = 0; danmakuClickAt.lucky = 0;
         }
         /* v9.41：聊天室的 DOM 过滤下线后，这两项只看 danmakuSwitchOff 本身
            （上面已经 early return 过了，走到这里就是要关这两个开关）。
            以前它们依赖 hideGiftMsg / hideLuckyBag，那两个键删掉后会变成永远 false，
            这个功能就整个失效了。 */
+        /* v9.47：以为两个都关掉了，也先复查一遍再收工 —— 点完不一定会变 */
+        verifyDanmakuOff('gift');
+        verifyDanmakuOff('lucky');
         const needGift = !danmakuDone.gift;
         const needLucky = !danmakuDone.lucky;
         if (!needGift && !needLucky) return;
-        // 4 次就永久放弃太 aggressive：冷却 25s 后可继续，单房间最多 20 轮
-        if (Date.now() < danmakuCooldownUntil || danmakuAttempts >= 20) return;
+        // 冷却 25s 后可继续；单房间最多 30 轮（含 v9.47 的复查重试）
+        if (Date.now() < danmakuCooldownUntil || danmakuAttempts >= 30) return;
         const icon = document.querySelector('[data-e2e="danmaku-setting-icon"]');
         if (!icon) { danmakuNote = 'no-icon'; return; }
         const props = dyReactProps(icon);
@@ -5046,6 +5142,162 @@
                 }
             }
         }
+    }
+
+    /* v9.47：弹幕开关专项诊断。
+       现象是「面板能弹出来，但两个开关没被点掉」，所以排查点只有三个：
+       文案找不找得到 / 开关配不配得上 / 状态读不读得出。这里自己把面板弹出来，
+       把这三步的中间结果全部打印，一次就能看出卡在哪。
+       面板是 hover 出来的，合成事件在某些版本弹不出来 —— 真弹不出来就先手动
+       把鼠标移到播放器右下角的弹幕按钮上，再点这个按钮。 */
+    function dumpDanmakuSwitch() {
+        const icon = document.querySelector('[data-e2e="danmaku-setting-icon"]');
+        if (!icon) {
+            copyText('# 弹幕开关诊断\n没有找到 [data-e2e="danmaku-setting-icon"]');
+            showTip('没找到弹幕设置图标', 2000);
+            return;
+        }
+        const props = dyReactProps(icon);
+        const canHover = !!(props && typeof props.onMouseEnter === 'function');
+        if (canHover) openDanmakuPanel(icon, props);
+        /* 面板是 hover 出来的：点按钮时鼠标必然离开播放器，面板会跟着收起。
+           所以留 3 秒窗口，让用户把鼠标挪回弹幕按钮上把面板重新hover出来。 */
+        showTip('请把鼠标移到右下角弹幕按钮上，面板一出现就自动抓取', 3200);
+        const collect = () => {
+            const lines = [];
+            const p = (x) => lines.push(x);
+            const box = (el) => {
+                let r = null; try { r = el.getBoundingClientRect(); } catch (e) {}
+                return r ? [r.left, r.top, r.width, r.height].map(n => Math.round(n)).join(',') : '(无)';
+            };
+            const cls = (el) => {
+                const c = String((el && el.className) || '');
+                return c.length > 46 ? c.slice(0, 46) + '…' : c;
+            };
+            const bg = (el) => {
+                try { return window.getComputedStyle(el).backgroundColor || ''; } catch (e) { return ''; }
+            };
+            p('# 抖音优化 · 弹幕开关诊断');
+            p('url: ' + location.href);
+            /* 这一行最关键：false 就代表功能整个没启动，后面几段再完美也不会动。
+               同时把 localStorage 里的原值也打出来，分清是「没开」还是「没存进去」。 */
+            let stored = '(读不到)';
+            try {
+                const raw = localStorage.getItem(CONFIG_KEY);
+                const obj = raw ? JSON.parse(raw) : null;
+                if (obj && Object.prototype.hasOwnProperty.call(obj, 'danmakuSwitchOff'))
+                    stored = String(obj.danmakuSwitchOff) + ' (v=' + (obj.__v == null ? '?' : obj.__v) + ')';
+                else if (obj) stored = '(存档里没有这个键 → 走默认 false)';
+            } catch (e) { stored = '(解析失败)'; }
+            p('config.danmakuSwitchOff: ' + config.danmakuSwitchOff +
+              (config.danmakuSwitchOff ? '' : '   ← 功能是关着的，不会执行任何点击'));
+            p('localStorage.danmakuSwitchOff: ' + stored + ' | crossDomainSync=' + config.crossDomainSync);
+            p('icon: rect=' + box(icon) + ' | props=' + (props ? 'yes' : 'no') +
+              ' | onMouseEnter=' + canHover);
+            p('state: done=' + JSON.stringify(danmakuDone) +
+              ' busy=' + danmakuBusy + ' attempts=' + danmakuAttempts +
+              ' cooldownMs=' + Math.max(0, danmakuCooldownUntil - Date.now()) +
+              ' note=' + danmakuNote);
+            p('');
+
+            /* ① 文案：不限定层级，凡是文字里含这两个词的元素都列出来 */
+            const labels = ['送礼信息', '福袋口令'];
+            const found = {};
+            const allEls = document.querySelectorAll('div,span,label,i,em,p,button,strong');
+            const cap = Math.min(allEls.length, 9000);
+            for (const lab of labels) {
+                const hits = [];
+                for (let i = 0; i < cap; i++) {
+                    const el = allEls[i];
+                    if (inOurPanel(el)) continue;
+                    const t = (el.textContent || '').trim();
+                    if (t !== lab) continue;            // 只认完全等于文案的节点
+                    const r = el.getBoundingClientRect();
+                    if (!r.width && !r.height) continue;
+                    hits.push({ el: el, r: r });
+                }
+                /* 同一行会有多个祖先都「textContent === 文案」，只保留最小（叶子）那个 */
+                hits.sort((a, b) => (a.el.querySelectorAll('*').length - b.el.querySelectorAll('*').length));
+                found[lab] = hits;
+                p('## 文案「' + lab + '」命中 ' + hits.length + ' 个（按子元素数排序，第 1 个是最叶子）');
+                hits.slice(0, 4).forEach((h, i) => {
+                    p('  [' + i + '] <' + h.el.tagName.toLowerCase() + '> class="' + cls(h.el) +
+                      '" rect=' + box(h.el) + ' kids=' + h.el.querySelectorAll('*').length +
+                      ' bg=' + bg(h.el));
+                    p('       父: <' + (h.el.parentElement ? h.el.parentElement.tagName.toLowerCase() : '-') +
+                      '> class="' + (h.el.parentElement ? cls(h.el.parentElement) : '') + '"');
+                });
+                if (!hits.length) p('  (没有) —— 面板可能没弹出来，先把鼠标移到弹幕按钮上再试');
+                p('');
+            }
+
+            /* ② 每个文案右侧的候选：开关到底长什么样、状态读成什么 */
+            for (const lab of labels) {
+                const first = (found[lab] || [])[0];
+                if (!first) continue;
+                const lr = first.r;
+                const lcy = (lr.top + lr.bottom) / 2;
+                const cands = [];
+                for (let i = 0; i < cap; i++) {
+                    const el = allEls[i];
+                    if (inOurPanel(el) || el === first.el) continue;
+                    if (el.contains(first.el) || first.el.contains(el)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 12 || r.width > 120 || r.height < 8 || r.height > 56) continue;
+                    const cy = (r.top + r.bottom) / 2;
+                    if (Math.abs(cy - lcy) > 26) continue;          // 同一行
+                    if (r.left < lr.left - 6) continue;             // 在右侧
+                    if (r.left - lr.right > 420) continue;          // 别太远
+                    cands.push({ el: el, r: r, d: Math.abs(cy - lcy) + (r.left - lr.right) * 0.05 });
+                }
+                cands.sort((a, b) => a.d - b.d);
+                p('## 「' + lab + '」右侧同行候选（按距离排序）');
+                if (!cands.length) p('  (没有候选 —— 阈值内一个都没匹配上)');
+                cands.slice(0, 8).forEach((c, i) => {
+                    const a = c.el.getAttribute ? (c.el.getAttribute('aria-checked') || '') : '';
+                    const role = c.el.getAttribute ? (c.el.getAttribute('role') || '') : '';
+                    const h = dyCheckboxHandler(c.el);
+                    p('  [' + i + '] <' + c.el.tagName.toLowerCase() + '> class="' + cls(c.el) +
+                      '" rect=' + box(c.el) + ' role=' + (role || '-') + ' aria=' + (a || '-') +
+                      ' bg=' + bg(c.el));
+                    p('       checked=' + String(h.checked) + ' explicit=' + h.explicit +
+                      ' onClick=' + (typeof h.onClick === 'function' ? 'yes' : 'no'));
+                });
+                p('');
+            }
+
+            /* ③ SWITCH_SEL 全局命中：如果上面候选全是普通 div，这里能看出真正的开关类名 */
+            let switches = [];
+            try { switches = Array.from(document.querySelectorAll(SWITCH_SEL)); } catch (e) {}
+            p('## SWITCH_SEL 全局命中 ' + switches.length + ' 个（列表前 20，只取视口内的）');
+            let shown = 0;
+            for (const sw of switches) {
+                if (shown >= 20) break;
+                const r = sw.getBoundingClientRect();
+                if (!r.width || !r.height) continue;
+                shown++;
+                const h = dyCheckboxHandler(sw);
+                p('  <' + sw.tagName.toLowerCase() + '> class="' + cls(sw) + '" rect=' + box(sw) +
+                  ' bg=' + bg(sw) + ' checked=' + String(h.checked) + ' explicit=' + h.explicit);
+            }
+            if (!shown) p('  (一个都没命中)');
+            p('');
+            p('# 说明：note 显示 no-label / no-switch / unknown-state / weak-off 时，');
+            p('#       对照上面三段就能知道是「文案没找到」「右侧没候选」还是「状态读不出」。');
+
+            copyText(lines.join('\n'));
+            showTip('弹幕开关诊断已复制', 1600);
+            try { closeDanmakuPanel(icon, props); } catch (e) {}
+        };
+        /* 面板一出现就抓，最多等 6 秒。中途手动悬停、合成 hover 成功都能救回来。 */
+        let waited = 0;
+        const tick = () => {
+            waited++;
+            const ready = !!findDanmakuLabelEl('送礼信息') || !!findDanmakuLabelEl('福袋口令');
+            if (ready || waited > 15) { collect(); return; }
+            setTimeout(tick, 400);
+        };
+        setTimeout(tick, 400);
     }
 
     /* 排障：导出聊天室结构、命中文本与元素父链，一次定位选择器/文案问题。 */
@@ -9666,6 +9918,81 @@
         } catch (e) { cleanPopupObserver = null; }
     }
 
+    /* v9.47：底部那道「透明方块」——
+       直播页底部的 OperatingBarPluginContainer 是个**占高度的普通块**（不是浮层），
+       里面装的是礼物栏 / 礼物托盘 / 评论输入。我们把礼物那几块 display:none 之后，
+       它自己那 88px 照样留着：变成一块看不见但占位的透明方块，
+       把播放器整个往上顶（诊断里 video 只有 622 高、窗口 710，差的 88 就是它）。
+       只在「里面确实一个可见子元素都没有」时收成 0 高；一旦有内容重新出现
+       （比如评论输入框弹出来）立刻还原，不会误伤。 */
+    function collapseEmptyOpBar() {
+        let bars;
+        try { bars = document.querySelectorAll('div[class*="OperatingBarPluginContainer"]'); } catch (e) { return; }
+        if (!bars.length) return;
+        /* 只用「高度归零」这一套，不设 overflow:hidden，也不动 flex：
+           · 不设 overflow —— 万一以后评论输入框在里面显示，不会被裁掉；
+           · 不动 flex —— 父容器是 row 还是 column 不确定，flex-basis 归零
+             在 row 下会把宽度也压掉；height 归零两种方向都只是「不占高度」。 */
+        const PROPS = [['height', '0'], ['min-height', '0'], ['max-height', '0'],
+            ['padding', '0'], ['margin', '0']];
+        /* 「里面有没有画出东西」用 rect 判断：display:none 的子树 rect 全是 0，
+           隐藏得再深也测得到 0 —— 比逐层读 computedStyle 便宜，也不会误判
+           那些「本身不隐藏、只是里面空了」的包装层。 */
+        const paintsSomething = (bar) => {
+            let kids;
+            try { kids = bar.querySelectorAll('*'); } catch (e) { return true; }
+            const n = Math.min(kids.length, 400);
+            for (let i = 0; i < n; i++) {
+                let r;
+                try { r = kids[i].getBoundingClientRect(); } catch (e) { continue; }
+                if (r.width >= 4 && r.height >= 4) return true;
+            }
+            return false;
+        };
+        for (const bar of bars) {
+            const hidden = !paintsSomething(bar);
+            const collapsed = bar.getAttribute('data-gm-opcollapsed') === '1';
+            if (hidden && !collapsed) {
+                /* 记下它原本占多少高度：抖音会把「底部操作栏高度」缓存进控制条的
+                   偏移里（710-88=622 就是那个 88），后面要用这个数去比对。 */
+                let before = 0;
+                try { before = Math.round(bar.getBoundingClientRect().height); } catch (e) {}
+                if (before > 4) bar.setAttribute('data-gm-oph', String(before));
+                bar.setAttribute('data-gm-opcollapsed', '1');
+                for (const [k, v] of PROPS) { try { bar.style.setProperty(k, v, 'important'); } catch (e) {} }
+                /* 播放器按容器尺寸算画面，容器一变高就催一次 resize 让它重算 */
+                try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+                /* 折叠会把控制条顶到窗口外，立刻贴回底部；再补一拍兜住重渲染 */
+                try { restoreControlBar(); } catch (e) {}
+            } else if (!hidden && collapsed) {
+                bar.removeAttribute('data-gm-opcollapsed');
+                for (const [k] of PROPS) { try { bar.style.removeProperty(k); } catch (e) {} }
+                try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+            }
+        }
+    }
+
+    /* v9.47：这里原本有一段「闭环校准」，想修控制条不贴窗口底的问题。
+       实测证明它反而把 Edge 弄坏了 —— 诊断记下的接管是 `gap=-713`，
+       说明接管发生在控制条还没渲染完的过渡态；接管后 left/right 归零让它
+       变成整窗口宽，右侧就伸到聊天室底下被压住，而且 fixed 之后不再随
+       播放器尺寸变化。Chrome 那个偏移是它自己的布局问题（关掉脚本也一样错），
+       先等它自己修，不值得为它把正常的浏览器改坏。
+       所以这段现在只做一件事：把以前被接管过的元素还原回抖音原生排版。 */
+    let ctrlCalibNote = 'disabled';
+    function restoreControlBar() {
+        let list;
+        try { list = document.querySelectorAll('[data-gm-barcalib]'); } catch (e) { return; }
+        if (!list.length) return;
+        for (const c of list) {
+            c.removeAttribute('data-gm-barcalib');
+            for (const k of ['position', 'left', 'right', 'top', 'bottom', 'z-index', 'width']) {
+                try { c.style.removeProperty(k); } catch (e) {}
+            }
+        }
+        ctrlCalibNote = 'restored ' + list.length;
+    }
+
     const COMMON_TASKS = [
         ensureObserver,
         refreshSidebarRoot,
@@ -9695,6 +10022,8 @@
         keepPlaybackRate,          // 直播流自己会跳过（duration=Infinity）
         guardResumeAudio,
         hideLivePopupsTask,
+        collapseEmptyOpBar,        // v9.47：礼物栏藏掉后，底部别留一块透明占位
+        restoreControlBar,         // v9.47：把以前误接管的控制条还原回抖音原生排版
         /* v9.43：updateViewerCount / pollViewerCount 从这里挪走了 ——
            它们改由下面的专属定时器驱动（350ms / 1s），不再被 1.5s 主循环拖慢。 */
         muteGiftAudios
@@ -9725,6 +10054,511 @@
         copyText(perfReport());
         showTip('性能诊断已复制', 1600);
     }
+
+    /* v9.47：布局诊断 —— 针对「底部多一条空白带 / 控制条不在最底部」这类纯几何问题。
+       核心手段是 elementFromPoint：直接问浏览器「这个坐标上是谁在画」，
+       再配一份顶层容器清单（谁多高、谁从多少像素开始），就能一眼看出
+       那几十像素是谁占的 —— 比逐个猜选择器快得多。
+       抖音里开控制台会断网，所以照旧走「复制到剪贴板」。 */
+    function descEl(el) {
+        if (!el) return 'null';
+        if (el === document.documentElement) return '<html>';
+        if (el === document.body) return '<body>';
+        let s = '';
+        try { s = el.tagName.toLowerCase(); } catch (e) { return '?'; }
+        try { if (el.id) s += '#' + el.id; } catch (e) {}
+        try {
+            const cls = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean);
+            if (cls.length) s += '.' + cls.slice(0, 2).join('.');
+        } catch (e) {}
+        try {
+            const e2e = el.getAttribute('data-e2e');
+            if (e2e) s += '[e2e=' + e2e + ']';
+        } catch (e) {}
+        return s;
+    }
+    function rectOf(el) {
+        try {
+            const r = el.getBoundingClientRect();
+            return [r.left, r.top, r.width, r.height].map(n => Math.round(n)).join(',');
+        } catch (e) { return 'err'; }
+    }
+    function boxOf(el) {
+        let bg = '?', disp = '?', pos = '?';
+        try {
+            const cs = window.getComputedStyle(el);
+            bg = cs.backgroundColor;
+            disp = cs.display;
+            pos = cs.position;
+        } catch (e) {}
+        return 'rect=' + rectOf(el) + ' disp=' + disp + ' pos=' + pos + ' bg=' + bg;
+    }
+    function dumpLayout() {
+        const L = [];
+        const p = (s) => L.push(s);
+        const vw = window.innerWidth, vh = window.innerHeight;
+        p('# 抖音布局诊断（底部空白带 / 高度异常）');
+        p('url: ' + location.href);
+        p('host: ' + location.hostname + ' | live=' + (isLiveHost || isLivePage()));
+        p('viewport: ' + vw + 'x' + vh + ' | dpr=' + (window.devicePixelRatio || 1) +
+          ' | screen: ' + screen.width + 'x' + screen.height);
+        try {
+            p('html.class: ' + (document.documentElement.getAttribute('class') || '-'));
+            const nb = window.getComputedStyle(document.documentElement)
+                .getPropertyValue('--gm-nav-bg').trim();
+            p('--gm-nav-bg: ' + (nb || '(未设置)'));
+        } catch (e) {}
+        p('fullscreenEl: ' + (document.fullscreenElement ? descEl(document.fullscreenElement) : 'null') +
+          ' | webkit: ' + (document.webkitFullscreenElement ? descEl(document.webkitFullscreenElement) : 'null'));
+        /* 100vh 实测值：和 innerHeight 不一致说明抖音/浏览器用的是旧的视口高度 */
+        let vhPx = null;
+        try {
+            const probe = document.createElement('div');
+            probe.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:100vh;';
+            (document.body || document.documentElement).appendChild(probe);
+            vhPx = Math.round(probe.getBoundingClientRect().height);
+            probe.remove();
+        } catch (e) {}
+        const de = document.documentElement, bd = document.body;
+        p('docEl: ' + boxOf(de) + ' client=' + de.clientWidth + 'x' + de.clientHeight +
+          ' scroll=' + de.scrollWidth + 'x' + de.scrollHeight);
+        if (bd) p('body: ' + boxOf(bd) + ' scroll=' + bd.scrollWidth + 'x' + bd.scrollHeight);
+        p('100vh: ' + (vhPx == null ? '(测不到)' : vhPx + 'px') +
+          ' | innerHeight: ' + vh + 'px | 差: ' + (vhPx == null ? '?' : (vh - vhPx) + 'px'));
+
+        p('');
+        p('## 关键容器');
+        const sels = [
+            '#root', '#dark', '#douyin-header', '#douyin-right-container', '#douyin-navigation',
+            '[data-e2e="living-container"]', '.living_player_container',
+            '[data-e2e="living_player_container"]', '[class*="living_player"]',
+            '[class*="player-container"]', '.xgplayer', '.xgplayer-container', '.douyin-player-controls',
+            '#BottomLayout', '#GiftTrayLayout', '[data-e2e="gifts-container"]',
+            'div[class*="OperatingBarPluginContainer"]',
+            '[data-e2e="live-room-audience"]', 'video'
+        ];
+        for (const s of sels) {
+            let el = null;
+            try { el = document.querySelector(s); } catch (e) {}
+            p('  ' + s + ': ' + (el ? boxOf(el) : '(无)'));
+        }
+
+        /* 顶层兄弟清单：底部那条带子最可能是某个「从 X 像素开始、高 Y」的兄弟撑出来的 */
+        const roots = [];
+        try { if (de.firstElementChild) roots.push(de.firstElementChild); } catch (e) {}
+        const walkTop = (root, tag) => {
+            if (!root) return;
+            let kids = [];
+            try { kids = Array.from(root.children).slice(0, 12); } catch (e) {}
+            if (!kids.length) return;
+            p('');
+            p('## ' + tag + ' 的直接子元素（' + kids.length + ' 个，最多列 12）');
+            for (const k of kids) p('  ' + k.tagName.toLowerCase() + ' ' + descEl(k) + ' ' + boxOf(k));
+        };
+        const rootEl = document.querySelector('#root') || document.querySelector('#dark');
+        walkTop(rootEl, descEl(rootEl) || '#root');
+        /* 底部操作栏：那 88px 平时是礼物栏 / 评论输入的位置，空着就是一块透明占位 */
+        try {
+            const opBar = document.querySelector('div[class*="OperatingBarPluginContainer"]');
+            if (opBar) {
+                p('');
+                p('## 底部操作栏 ' + descEl(opBar) + ' ' + boxOf(opBar) +
+                  ' | 子元素 ' + opBar.children.length + ' 个 | gm折叠=' +
+                  (opBar.getAttribute('data-gm-opcollapsed') || 'no'));
+                for (const kid of Array.from(opBar.children).slice(0, 10)) {
+                    p('  ' + descEl(kid) + ' ' + boxOf(kid));
+                }
+            }
+        } catch (e) {}
+        try {
+            const player = document.querySelector('[data-e2e="living-container"]') ||
+                document.querySelector('[class*="living_player"]') ||
+                document.querySelector('.xgplayer');
+            if (player && player.parentElement) walkTop(player.parentElement, descEl(player.parentElement));
+        } catch (e) {}
+
+        p('');
+        p('## 底部取样点（elementsFromPoint，整叠从上层到下层）');
+        /* 用复数版：单数版只给最上层，而播放器上盖着点赞特效层，
+           永远只会返回它，看不到下面真正排布的控件。 */
+        const pts = [
+            ['底边中点', vw / 2, vh - 3],
+            ['底边偏左', 24, vh - 3],
+            ['底边偏右', vw - 24, vh - 3],
+            ['底上 45', vw / 2, vh - 45],
+            ['底上 90', vw / 2, vh - 90],
+            ['底上 130', vw / 2, vh - 130]
+        ];
+        for (const [name, x, y] of pts) {
+            let stack = [];
+            try { stack = document.elementsFromPoint(x, y) || []; } catch (e) {}
+            p('  [' + name + ' ' + Math.round(x) + ',' + Math.round(y) + '] ' + stack.length + ' 层');
+            for (const el of stack.slice(0, 8)) {
+                p('    - ' + descEl(el) + ' ' + boxOf(el));
+            }
+            if (!stack.length) p('    (null)');
+        }
+
+        /* 底部那一排控件：按几何找出来，再挖它们用的偏移量。
+           现在的情况是「操作栏已经收成 0 高，但控制条还停在离底 88px 的地方」——
+           710 - 88 = 622，正好是原来操作栏的高度，说明抖音把这个高度缓存进了
+           某个 bottom / CSS 变量里。下面三段就是去找那个 88 藏在哪。 */
+        p('');
+        p('## 底部控件（按几何定位：底上 30~150px 内的宽元素）');
+        try {
+            const cands = [];
+            const all = document.querySelectorAll('div');
+            const cap = Math.min(all.length, 9000);
+            for (let i = 0; i < cap; i++) {
+                const el = all[i];
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+                if (r.width < 200 || r.height < 8 || r.height > 70) continue;
+                const gap = vh - r.bottom;
+                if (gap < 30 || gap > 150) continue;
+                cands.push([gap, el, r]);
+            }
+            cands.sort((a, b) => a[0] - b[0]);
+            if (!cands.length) p('  (没有符合条件的元素)');
+            for (const [gap, el, r] of cands.slice(0, 8)) {
+                let cs = null;
+                try { cs = window.getComputedStyle(el); } catch (e) {}
+                p('  距底 ' + Math.round(gap) + 'px  ' + descEl(el) + ' rect=' + rectOf(el) +
+                  (cs ? ' | pos=' + cs.position + ' bottom=' + cs.bottom + ' top=' + cs.top +
+                        ' bottomPx=' + cs.getPropertyValue('bottom') : ''));
+                try {
+                    const inline = (el.getAttribute('style') || '').slice(0, 140);
+                    if (inline) p('      inline: ' + inline);
+                } catch (e) {}
+                let up = el.parentElement, d = 0;
+                while (up && d++ < 3) {
+                    let cs2 = null;
+                    try { cs2 = window.getComputedStyle(up); } catch (e) {}
+                    p('      ^ ' + descEl(up) + ' rect=' + rectOf(up) +
+                        (cs2 ? ' pos=' + cs2.position + ' bottom=' + cs2.bottom : ''));
+                    up = up.parentElement;
+                }
+            }
+        } catch (e) {}
+
+        /* CSS 变量里最可能藏那个 88：抖音常把「底部操作栏高度」挂在
+           播放器容器上（如 --operating-bar-h: 88px），控制条用它做 bottom。 */
+        p('');
+        p('## 播放器祖先上的 CSS 变量（含数字的才列）');
+        try {
+            const seeds = [
+                document.querySelector('.douyin-player-controls'),
+                document.querySelector('#PlayerLayout'),
+                document.querySelector('[class*="__livingPlayer__"]'),
+                document.querySelector('[data-e2e="living-container"]'),
+                document.querySelector('[data-e2e="LikeLayout"], #LikeLayout'),
+                document.querySelector('div[class*="OperatingBarPluginContainer"]')
+            ].filter(Boolean);
+            const seen = new Set();
+            for (const seed of seeds) {
+                let el = seed, d = 0;
+                while (el && d++ < 5 && !seen.has(el)) {
+                    seen.add(el);
+                    let cs = null;
+                    try { cs = window.getComputedStyle(el); } catch (e) { break; }
+                    const vars = [];
+                    for (let i = 0; i < cs.length; i++) {
+                        const name = cs[i];
+                        if (name.slice(0, 2) !== '--') continue;
+                        const v = (cs.getPropertyValue(name) || '').trim();
+                        if (!/\d/.test(v) || /var\(/.test(v)) continue;
+                        vars.push(name + ': ' + v);
+                    }
+                    if (vars.length) {
+                        p('  ' + descEl(el) + ' (' + vars.length + ' 个)');
+                        for (const v of vars.slice(0, 12)) p('    ' + v);
+                    }
+                    el = el.parentElement;
+                }
+            }
+        } catch (e) {}
+
+        /* 直接找「底部留了一大截偏移」的绝对定位元素：那个 88px 就在这类元素身上 */
+        p('');
+        p('## 用 bottom>30px 绝对定位的元素（播放器子树内）');
+        try {
+            const scope = document.querySelector('#PlayerLayout') ||
+                document.querySelector('[class*="__livingPlayer__"]') ||
+                document.querySelector('[data-e2e="living-container"]') || document.body;
+            const all = scope.querySelectorAll('*');
+            const cap = Math.min(all.length, 3000);
+            let shown = 0;
+            for (let i = 0; i < cap && shown < 12; i++) {
+                const el = all[i];
+                let cs = null;
+                try { cs = window.getComputedStyle(el); } catch (e) { continue; }
+                if (cs.position !== 'absolute' && cs.position !== 'fixed') continue;
+                const b = parseFloat(cs.bottom);
+                if (!(b > 30)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 60) continue;
+                shown++;
+                p('  ' + descEl(el) + ' bottom=' + cs.bottom + ' rect=' + rectOf(el) +
+                  ' | 距底 ' + Math.round(vh - r.bottom) + 'px | inline=' +
+                  ((el.getAttribute('style') || '').slice(0, 90) || '-'));
+            }
+            if (!shown) p('  (没有：说明那个 88 不在 bottom 上)');
+        } catch (e) {}
+
+        /* 直接把控制条容器里的每一个后代摊开：谁离底多远、用什么定位 */
+        p('');
+        p('## .douyin-player-controls 实例');
+        try {
+            const ctls = document.querySelectorAll('.douyin-player-controls');
+            p('  共有 ' + ctls.length + ' 个');
+            let idx = 0;
+            for (const ctl of ctls) {
+                idx++;
+                if (idx > 4) break;
+                const kids = ctl.querySelectorAll('*');
+                let sized = 0;
+                for (const el of kids) {
+                    let r; try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+                    if (r.width >= 4 && r.height >= 4) sized++;
+                    if (sized > 99) break;
+                }
+                p('  #' + idx + ' rect=' + rectOf(ctl) + ' 后代 ' + kids.length + ' 个，其中有尺寸 ' + sized +
+                  ' 个 | shadowRoot=' + (ctl.shadowRoot ? '有' : '无') +
+                  ' | 接管=' + (ctl.getAttribute('data-gm-barcalib') === '1' ? 'yes' : 'no') +
+                  ' | inline bottom=' + (ctl.style.getPropertyValue('bottom') || '-') +
+                  ' | 距窗口底=' + Math.round(vh - ctl.getBoundingClientRect().bottom));
+                p('      校准状态: ' + (ctrlCalibNote || '-'));
+                if (!sized) { p('      (整个子树没一个元素有尺寸 → 控制条没被真正渲染)'); continue; }
+                for (const el of Array.from(kids)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 4 || r.height < 4) continue;
+                    let cs = null;
+                    try { cs = window.getComputedStyle(el); } catch (e) {}
+                    p('    ' + descEl(el) + ' rect=' + [r.left, r.top, r.width, r.height].map(n => Math.round(n)).join(',') +
+                      ' 距底 ' + Math.round(vh - r.bottom) +
+                      (cs ? ' pos=' + cs.position + ' bottom=' + cs.bottom : ''));
+                }
+            }
+        } catch (e) {}
+
+        /* 影子 DOM：玩家 UI 有可能是塞在 shadow root 里的，普通查询看不到，
+           但元素上的 shadowRoot 属性可以查到 */
+        p('');
+        p('## 播放器子树里的 shadowRoot');
+        try {
+            const scope2 = document.querySelector('#PlayerLayout') ||
+                document.querySelector('[class*="__livingPlayer__"]') || document.body;
+            const all2 = scope2.querySelectorAll('*');
+            const cap2 = Math.min(all2.length, 4000);
+            let n = 0;
+            for (let i = 0; i < cap2 && n < 8; i++) {
+                if (all2[i].shadowRoot) {
+                    n++;
+                    p('  ' + descEl(all2[i]) + ' rect=' + rectOf(all2[i]));
+                }
+            }
+            if (!n) p('  (没有)');
+        } catch (e) {}
+
+        /* 老办法：按文案找（有的版本按钮上是文字，能直接看到它自己离底多远） */
+        p('');
+        p('## 底部控件（按文案定位）');
+        try {
+            const want = /^(原画|蓝光|超清|高清|标清|流畅|弹幕|清屏|连播|倍速|发送|说点什么|礼物)$/;
+            const hits = [];
+            const all = document.querySelectorAll('*');
+            const cap = Math.min(all.length, 12000);
+            for (let i = 0; i < cap && hits.length < 10; i++) {
+                const el = all[i];
+                if (el.childElementCount > 0) continue;
+                const t = (el.textContent || '').replace(/\s+/g, '');
+                if (!want.test(t)) continue;
+                const r = el.getBoundingClientRect();
+                if (!r.width && !r.height) continue;
+                hits.push([t, el, r]);
+            }
+            if (!hits.length) p('  (没找到，可能文案不同)');
+            for (const [t, el, r] of hits) {
+                p('  "' + t + '" rect=' + [r.left, r.top, r.width, r.height].map(n => Math.round(n)).join(',') +
+                  ' | 距底 ' + Math.round(vh - r.bottom) + 'px');
+                let up = el.parentElement, d = 0;
+                while (up && d++ < 5) {
+                    let cs = null;
+                    try { cs = window.getComputedStyle(up); } catch (e) {}
+                    p('      ^ ' + descEl(up) + ' rect=' + rectOf(up) +
+                        (cs ? ' pos=' + cs.position + ' bottom=' + cs.bottom + ' h=' + cs.height : ''));
+                    up = up.parentElement;
+                }
+            }
+        } catch (e) {}
+
+        p('');
+        p('## 悬停快照（控制条出现时的底部叠层）');
+        try {
+            if (!bottomSnap) p('  (还没抓到：先把鼠标在播放器底部晃两下，再点诊断)');
+            else {
+                p('  抓取时间: ' + bottomSnap.at + '，命中控件的采样 ' + bottomSnap.rows.length + ' 档（★ = 尺寸像真控件的）');
+                let shown = 0;
+                for (const row of bottomSnap.rows) {
+                    if (shown >= 10) break;
+                    shown++;
+                    p('  [底上 ' + row.dy + 'px, x=' + Math.round((row.nx || 0.75) * 100) + '%]');
+                    for (const it of row.list) p('    ' + (it.small ? '★ ' : '  ') + it.d + ' rect=' + it.r);
+                }
+                if (bottomSnap.texts && bottomSnap.texts.length) {
+                    p('  —— 按文案定位到的控制条按钮 ——');
+                    for (const it of bottomSnap.texts) {
+                        p('  "' + it.t + '" rect=' + it.r);
+                        for (const c of it.chain) p('      ^ ' + c);
+                    }
+                } else {
+                    p('  (文案没扫到：鼠标要停在画面底部让控制条出现)');
+                }
+            }
+        } catch (e) {}
+
+        /* 兜底：整篇文档扫一遍「底部区域里的宽元素」。控制条万一挂在我们没猜到的
+           容器里（或者根本不在播放器子树内），这一步也能把它捞出来。 */
+        p('');
+        p('## 全文档：底上 0~300px 内的宽元素（宽≥160、高 8~80）');
+        try {
+            const all = document.querySelectorAll('*');
+            const cap = Math.min(all.length, 20000);
+            const cands = [];
+            for (let i = 0; i < cap; i++) {
+                const el = all[i];
+                if (el === document.documentElement || el === document.body) continue;
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+                if (r.width < 160 || r.height < 8 || r.height > 80) continue;
+                const gap = vh - r.bottom;
+                if (gap < -40 || gap > 300) continue;
+                cands.push([gap, el, r]);
+            }
+            cands.sort((a, b) => a[0] - b[0]);
+            if (!cands.length) p('  (没有)');
+            for (const [gap, el, r] of cands.slice(0, 14)) {
+                let cs = null;
+                try { cs = window.getComputedStyle(el); } catch (e) {}
+                p('  距底 ' + Math.round(gap) + '  ' + descEl(el) + ' rect=' + rectOf(el) +
+                  (cs ? ' pos=' + cs.position + ' z=' + cs.zIndex + ' vis=' + cs.visibility + ' op=' + cs.opacity : ''));
+            }
+        } catch (e) {}
+
+        p('');
+        p('## 全文档 shadowRoot 宿主（控制条可能渲染在影子树里）');
+        try {
+            const all3 = document.querySelectorAll('*');
+            const cap3 = Math.min(all3.length, 20000);
+            let n3 = 0;
+            for (let i = 0; i < cap3 && n3 < 10; i++) {
+                if (all3[i].shadowRoot) {
+                    n3++;
+                    p('  ' + descEl(all3[i]) + ' rect=' + rectOf(all3[i]));
+                }
+            }
+            if (!n3) p('  (没有)');
+        } catch (e) {}
+
+        p('');
+        p('## 我们自己的痕迹');
+        try {
+            p('  data-gm-real-count 节点: ' + document.querySelectorAll('[data-gm-real-count]').length);
+            p('  gm 面板/提示: ' +
+              (document.querySelector('#gm-settings-panel') ? 'panel 存在' : 'panel 无') + ' / ' +
+              (document.querySelector('#gm-tip') ? 'tip 存在' : 'tip 无'));
+            const stash = document.querySelectorAll('[data-gm-stash], [class*="gm-"]');
+            p('  *gm-* 元素数: ' + stash.length);
+        } catch (e) {}
+        return L.join('\n');
+    }
+    function dumpLayoutToClip() {
+        copyText(dumpLayout());
+        showTip('布局诊断已复制', 1600);
+    }
+
+    /* v9.47：底部那排控件只在鼠标停在播放器上时才渲染 —— 一打开设置面板，
+       鼠标就离开播放器，它们随即消失，任何「点按钮现量」的诊断都量不到。
+       这里在鼠标移动时抓一份「底部叠层快照」，面板里的诊断直接打印这份快照。
+       v9.47b：采样范围从「离底 24~96px」扩大到「16~256px，每 16px 一档」——
+       之前只采到 96px，而实测图标行在离底 100~120px 那一带，正好漏掉了，
+       所以总是抓不到真正在显示的那个元素。
+       只在「这一拍确实命中播放器以外的东西」时才覆盖快照，避免记录一份
+       “鼠标已经离开、控制条已隐藏”的空数据把好数据冲掉。 */
+    const PLAYER_WRAPPER_RE = /LikeLayout|PPcGIai7|like-layer|LikeEffect|LivingPlayer|pip-anchor|gZxYAuQb|livingPlayer|PlayerLayout|BackgroundLayout|living-container|scroll_container/i;
+    let bottomSnapAt = 0, bottomSnap = null;
+    /* v9.47c：按 class 找控制条一直找错（抖音有两条实例、还有一条是 hidden），
+       改成**按文案**定位：「原画 / 标清 / 弹幕 / 清屏」这些字只可能出现在控制条上。
+       用 TreeWalker 走文本节点，比 elementFromPoint 可靠 —— 不依赖命中坐标。
+       只在鼠标靠近画面底部时才扫，避免常态开销。 */
+    const CTL_LABEL_RE = /^(原画|蓝光|超清|高清|标清|流畅|弹幕|清屏|连播|倍速|画质|字幕|静音)$/;
+    function probeControlByText() {
+        const out = [];
+        try {
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let node, guard = 0;
+            while ((node = walker.nextNode()) && guard++ < 12000) {
+                const t = (node.nodeValue || '').trim();
+                if (!t || t.length > 6 || !CTL_LABEL_RE.test(t)) continue;
+                const el = node.parentElement;
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 2 || r.height < 2) continue;
+                const chain = [];
+                let up = el, d = 0;
+                while (up && d++ < 6) {
+                    let cs = null;
+                    try { cs = window.getComputedStyle(up); } catch (e) {}
+                    chain.push(descEl(up) + ' rect=' + rectOf(up) +
+                        (cs ? ' pos=' + cs.position + ' vis=' + cs.visibility + ' z=' + cs.zIndex : ''));
+                    up = up.parentElement;
+                }
+                out.push({ t: t, r: rectOf(el), chain: chain });
+                if (out.length >= 3) break;
+            }
+        } catch (e) {}
+        return out;
+    }
+    document.addEventListener('mousemove', (e) => {
+        if (!(isLiveHost || isLivePage())) return;
+        const now = Date.now();
+        if (now - bottomSnapAt < 800) return;
+        bottomSnapAt = now;
+        try {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const rows = [];
+            let real = false;
+            for (const nx of [0.1, 0.75]) {
+                for (let dy = 16; dy <= 320; dy += 16) {
+                    const stack = document.elementsFromPoint(Math.round(vw * nx), vh - dy) || [];
+                    const list = [];
+                    let rowReal = false;
+                    /* v9.47d：之前只留 3 层，而最上层是铺满全屏的覆盖层（div.YsD6aIyy
+                       这类），3 层被它和播放器外框占满，真正那排图标排在下面 —— 于是
+                       永远看不到它。现在留 8 层，且用「尺寸明显小于视口」作为
+                       『这是个真控件』的判据，而不是靠 class 名单去猜。 */
+                    for (const el of stack) {
+                        if (!el || el === document.documentElement || el === document.body) continue;
+                        const tag = (el.id || '') + ' ' + (el.getAttribute ? (el.getAttribute('class') || '') : '');
+                        if (/LikeLayout|PPcGIai7|like-layer|LikeEffect/i.test(tag)) continue;
+                        let r; try { r = el.getBoundingClientRect(); } catch (err) { continue; }
+                        const small = r.height > 4 && r.width > 4 &&
+                            r.width < vw - 40 && r.height < vh - 40;
+                        if (small) rowReal = true;
+                        list.push({ d: descEl(el), r: rectOf(el), small: small });
+                        if (list.length >= 8) break;
+                    }
+                    if (rowReal) { real = true; rows.push({ dy: dy, nx: nx, list: list }); }
+                }
+            }
+            /* 鼠标在画面下半部分才会让控制条出现，这时顺手做一次文案扫描 */
+            let texts = [];
+            if (e.clientY > vh - 260) texts = probeControlByText();
+            if (!real && !texts.length) return;    // 没有有效信息 → 保留上一份
+            bottomSnap = { at: new Date().toLocaleTimeString(), rows: real ? rows : (bottomSnap ? bottomSnap.rows : []),
+                texts: texts.length ? texts : (bottomSnap ? bottomSnap.texts : []) };
+        } catch (err) {}
+    }, { passive: true });
 
     setInterval(() => {
         if (document.hidden || !document.body) return;
@@ -10131,7 +10965,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.46</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.47</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>
@@ -10286,6 +11120,10 @@
                         <button type="button" id="gm-dump-filter" class="gm-btn">复制</button>
                     </div>
                     <div class="gm-setting-row">
+                        <span>复制弹幕开关诊断 (自动弹面板)</span>
+                        <button type="button" id="gm-dump-danmaku" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
                         <span>复制直播跳过诊断</span>
                         <button type="button" id="gm-dump-liveskip" class="gm-btn">复制</button>
                     </div>
@@ -10308,6 +11146,10 @@
                     <div class="gm-setting-row">
                         <span>复制性能诊断</span>
                         <button type="button" id="gm-dump-perf" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制布局诊断 (底部空白/高度异常)</span>
+                        <button type="button" id="gm-dump-layout" class="gm-btn">复制</button>
                     </div>
                     <div class="gm-hint" style="margin-top:10px;">
                         这些都是把结构化信息复制到剪贴板，贴给作者即可定位问题，不会改动任何设置。
@@ -10415,6 +11257,8 @@
 
         const filterBtn = panel.querySelector('#gm-dump-filter');
         if (filterBtn) filterBtn.addEventListener('click', () => safeRun(dumpLiveFilter));
+        const danmakuBtn = panel.querySelector('#gm-dump-danmaku');
+        if (danmakuBtn) danmakuBtn.addEventListener('click', () => safeRun(dumpDanmakuSwitch));
         const liveSkipBtn = panel.querySelector('#gm-dump-liveskip');
         if (liveSkipBtn) liveSkipBtn.addEventListener('click', () => safeRun(() => {
             copyText(dumpLiveSkip());
@@ -10438,6 +11282,9 @@
 
         const perfBtn = panel.querySelector('#gm-dump-perf');
         if (perfBtn) perfBtn.addEventListener('click', () => safeRun(dumpPerf));
+
+        const layoutBtn = panel.querySelector('#gm-dump-layout');
+        if (layoutBtn) layoutBtn.addEventListener('click', () => safeRun(dumpLayoutToClip));
 
         const camResetBtn = panel.querySelector('#gm-cam-reset');
         if (camResetBtn) camResetBtn.addEventListener('click', () => safeRun(camResetPos));

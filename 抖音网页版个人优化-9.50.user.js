@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.49
+// @version      9.50
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -3235,18 +3235,34 @@
        这么把唯一的候选过滤掉的）。
        每次调用都写 danmakuTrace，诊断里能直接看到每一层扫到了什么。 */
     let danmakuTrace = [];
+    let dmQuiet = 0;      // v9.50：复查时的配对过程不打 trace，否则几十拍就把日志刷爆
     function dmT(s) {
+        if (dmQuiet) return;
         danmakuTrace.push(s);
         if (danmakuTrace.length > 180) danmakuTrace.shift();   // v9.49：留最近 180 行
     }
     function findDanmakuSwitch(label, used) {
-        const lab = (label in dmLabelEls) ? dmLabelEls[label]
+        let lab = (label in dmLabelEls) ? dmLabelEls[label]
             : findDanmakuLabelEl(label, dmIcon);
         dmT('');
         dmT('## 找开关：' + label + '  (used=' + (used ? used.size : 0) + ')');
         dmT('  扫描: ' + dmScanInfo);
         if (!lab) { danmakuNote = 'no-label:' + label; dmT('  文案没找到'); return null; }
-        const lr = boxRect(lab);
+        let lr = boxRect(lab);
+        /* v9.50：缓存里的节点有可能在一次 React 重渲染后就被卸载了，
+           这时读出来是 0,0,0,0（不是 NaN —— NaN 是 v9.48 那个重名 bug 留下的）。
+           先原地重扫一次拿「现在活着」的那个，别急着判死。 */
+        if (!lr || !isFinite(lr.width) || !isFinite(lr.height) ||
+            (lr.width === 0 && lr.height === 0)) {
+            dmScanLabels(dmIcon);
+            const fresh = dmLabelEls[label];
+            if (fresh && fresh !== lab) {
+                lab = fresh;
+                lr = boxRect(lab);
+                dmT('  旧节点已卸载 → 换新节点，rect=' +
+                    (lr ? [lr.left, lr.top, lr.width, lr.height].map(n => Math.round(n)).join(',') : 'null'));
+            }
+        }
         if (!lr || !isFinite(lr.width) || !isFinite(lr.height) ||
             (lr.width === 0 && lr.height === 0)) {
             danmakuNote = 'label-hidden:' + label;
@@ -3387,10 +3403,23 @@
     }
     function dyFireClick(el) {
         try {
-            const init = { bubbles: true, cancelable: true, view: window };
-            el.dispatchEvent(new MouseEvent('pointerdown', init));
+            /* v9.50：把坐标定在元素正中间。以前 clientX/Y 都是 0，有些受控组件
+               会拿坐标做判断（有些站点甚至用它区分「程序点击」），点了等于白点。 */
+            const r = (() => { try { return el.getBoundingClientRect(); } catch (e) { return null; } })();
+            const x = r ? Math.round(r.left + r.width / 2) : 0;
+            const y = r ? Math.round(r.top + r.height / 2) : 0;
+            const init = {
+                bubbles: true, cancelable: true, view: window,
+                clientX: x, clientY: y, screenX: x, screenY: y, button: 0
+            };
+            if (typeof PointerEvent === 'function') {
+                el.dispatchEvent(new PointerEvent('pointerdown',
+                    Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 1 }, init)));
+            } else {
+                el.dispatchEvent(new MouseEvent('mousedown', init));
+            }
             el.dispatchEvent(new MouseEvent('mousedown', init));
-            el.dispatchEvent(new MouseEvent('mouseup', init));
+            el.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, init, { buttons: 0 })));
             el.dispatchEvent(new MouseEvent('click', init));
         } catch (e) {}
         try { el.click(); } catch (e2) {}
@@ -3403,6 +3432,11 @@
        最多 3 次，第二次改用 fiber 的 onClick。 */
     const danmakuClickAt = { gift: 0, lucky: 0 };
     const danmakuRetry = { gift: 0, lucky: 0 };
+    /* v9.50：点完必须在**面板还开着**的时候复查。以前放到主循环开头查，
+       可主循环跑的时候面板早收起来了，找不到开关就直接跳过 —— 等于没验。
+       现在改到 tick 里验，面板正开着，读得到真实状态。 */
+    const danmakuVerified = { gift: false, lucky: false };
+    const danmakuVerifyTries = { gift: 0, lucky: 0 };
     function turnOffDanmaku(key, used) {
         const label = DANMAKU_LABEL[key];
         const sw = findDanmakuSwitch(label, used);
@@ -3438,26 +3472,45 @@
         return true;
     }
     /* 复查：上一次点击已经把 done 置真，但开关实际还开着 → 打回重试 */
-    function verifyDanmakuOff(key) {
-        if (!danmakuDone[key] || !danmakuClickAt[key]) return;
-        if (Date.now() - danmakuClickAt[key] < 600) return;
+    /* v9.50：这个函数只在 tick 里调用（面板正开着的时候）。
+       返回 true 表示「这一项已经有结论了，不用再等」。 */
+    function verifyOne(key) {
+        if (!danmakuDone[key] || !danmakuClickAt[key]) return false;
+        if (danmakuVerified[key]) return true;
+        if (Date.now() - danmakuClickAt[key] < 600) return false;   // 等 React 更新
         const label = DANMAKU_LABEL[key];
         const keep = danmakuNote;            // findDanmakuSwitch 会写 note，别污染
-        const sw = findDanmakuSwitch(label, null);
-        if (!sw) { danmakuNote = keep; return; }
+        dmQuiet++;
+        let sw = null;
+        try { sw = findDanmakuSwitch(label, null); } finally { dmQuiet--; }
+        if (!sw) { danmakuNote = keep; return false; }   // 面板这会儿没开，下拍再说
         const h = dyCheckboxHandler(sw);
-        if (h.checked !== true) { danmakuNote = keep; return; }   // 读不出 / 已关完事
+        if (h.checked === false) {
+            danmakuVerified[key] = true;
+            danmakuNote = 'verified-off:' + label;
+            return true;
+        }
+        if (h.checked !== true) {
+            /* 状态读不出（既不是 true 也不是 false）：连续几次都读不出就认了，
+               别在这儿无限等下去 */
+            danmakuVerifyTries[key]++;
+            danmakuNote = keep;
+            if (danmakuVerifyTries[key] > 3) { danmakuVerified[key] = true; return true; }
+            return false;
+        }
         if (danmakuRetry[key] >= 4) {
             /* 反复点了还是开着：放弃本轮，别再每隔 1.5s 把面板弹出来烦人。
                换直播间（URL 变）会自动重置。 */
-            danmakuDone[key] = true;
+            danmakuVerified[key] = true;
             danmakuNote = 'give-up:' + label;
-            return;
+            return true;
         }
         danmakuDone[key] = false;
         danmakuRetry[key]++;
+        danmakuVerifyTries[key] = 0;
         danmakuCooldownUntil = 0;            // 别让 25s 冷却挡住重试
         danmakuNote = 'still-on:' + label + ' retry ' + danmakuRetry[key];
+        return false;
     }
     /* v9.49：把「鼠标停在按钮上」这件事做得更像真的。
        以前只调 props.onMouseEnter + 派发一次 mouseover，实测弹不出面板。
@@ -3516,19 +3569,6 @@
             }));
         } catch (e) {}
     }
-    /* v9.49：面板打开后每拍补一次 mousemove。抖音有些浮层挂了全局 mousemove
-       监听，鼠标一旦「不在上面」就收起来 —— 我们合成 hover 之后浏览器真实
-       指针还停在设置面板上，很容易被它判成离开了。 */
-    function nudgeHover(icon) {
-        const r = boxRect(icon);
-        if (!r) return;
-        try {
-            icon.dispatchEvent(new MouseEvent('mousemove', {
-                bubbles: true, view: window,
-                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2
-            }));
-        } catch (e) {}
-    }
     function closeDanmakuPanel(icon, props) {
         try { if (typeof props.onMouseLeave === 'function') props.onMouseLeave(); } catch (e) {}
         try {
@@ -3550,14 +3590,15 @@
             danmakuWeak.gift = 0; danmakuWeak.lucky = 0;
             danmakuRetry.gift = 0; danmakuRetry.lucky = 0;
             danmakuClickAt.gift = 0; danmakuClickAt.lucky = 0;
+            danmakuVerified.gift = false; danmakuVerified.lucky = false;
+            danmakuVerifyTries.gift = 0; danmakuVerifyTries.lucky = 0;
         }
         /* v9.41：聊天室的 DOM 过滤下线后，这两项只看 danmakuSwitchOff 本身
            （上面已经 early return 过了，走到这里就是要关这两个开关）。
            以前它们依赖 hideGiftMsg / hideLuckyBag，那两个键删掉后会变成永远 false，
            这个功能就整个失效了。 */
-        /* v9.47：以为两个都关掉了，也先复查一遍再收工 —— 点完不一定会变 */
-        verifyDanmakuOff('gift');
-        verifyDanmakuOff('lucky');
+        /* v9.50：复查挪到 tick 里做了。主循环每 1.5s 跑一次，那时面板早收起来了，
+           在这里查等于永远查不到（找不到开关就直接跳过），形同虚设。 */
         const needGift = !danmakuDone.gift;
         const needLucky = !danmakuDone.lucky;
         if (!needGift && !needLucky) return;
@@ -3577,26 +3618,46 @@
         let tries = 0;
         const timer = setInterval(() => {
             tries++;
-            /* v9.47：面板是 hover 才渲染的，合成 hover 一次不一定弹得出来
-               （用户实测：手动hover能关，让它自己开就关不掉）。
-               所以每 3 拍补扇一次，保证整个重试窗口里面板是活的。 */
-            if (tries > 1 && tries % 3 === 0 &&
-                ((needLucky && !danmakuDone.lucky) || (needGift && !danmakuDone.gift))) {
-                openDanmakuPanel(icon, props);
-            } else {
-                nudgeHover(icon);     // v9.49：其余拍只补 mousemove，别把面板刷掉
-            }
-            /* v9.49：每拍扫一遍文档，两个文案一起取（以前每拍扫两遍） */
+            /* v9.50 关键：**先看面板在不在，再决定要不要补扇**。
+               以前是无条件「每 3 拍补扇一次」，可面板已经开着的时候补扇 =
+               又派一次 mouseover/mousemove，React 会把面板整棵重挂一遍，
+               刚扫到的文案节点当场被卸载，rect 变成 0,0,0,0 ——
+               诊断里「hit=y」紧跟着「rect=0,0,0,0」就是这个。
+               现在：面板可见 → 只配对，绝不碰 DOM；面板不可见 → 这一拍只负责
+               叫醒，配对留到下一拍（React 渲染是异步的，同一拍里扫必然空手）。 */
             dmScanLabels(icon);
-            // 福袋口令先配对，避免被送礼信息抢走同行的开关
-            if (needLucky && !danmakuDone.lucky) turnOffDanmaku('lucky', used);
-            if (needGift && !danmakuDone.gift) turnOffDanmaku('gift', used);
-            const done = (!needGift || danmakuDone.gift) && (!needLucky || danmakuDone.lucky);
-            if (done || tries > 40) {
+            /* v9.50：used 只用于「同一拍里两个文案别抢同一个开关」。
+               每拍清空，否则复查失败后重试时，节点还挂在 used 里会被跳过，永远点不到。 */
+            used.clear();
+            const giftLab = dmLabelEls[DANMAKU_LABEL.gift];
+            const luckyLab = dmLabelEls[DANMAKU_LABEL.lucky];
+            const panelUp = !!(giftLab || luckyLab);
+            /* 每拍重算「还差哪一项」—— 复查失败会把 done 打回 false，
+               用进入循环时算的那份就会漏掉重试 */
+            const nGift = !danmakuDone.gift;
+            const nLucky = !danmakuDone.lucky;
+            if (!panelUp) {
+                if (tries === 1 || tries % 2 === 0) openDanmakuPanel(icon, props);
+                dmT('#' + tries + ' 面板未出现 → 补扇 hover');
+            } else {
+                dmT('#' + tries + ' 面板可见 gift=' + (giftLab ? 'y' : 'n') +
+                    ' lucky=' + (luckyLab ? 'y' : 'n'));
+                if (nLucky) turnOffDanmaku('lucky', used);   // 福袋口令先配，别被同行开关抢走
+                if (nGift) turnOffDanmaku('gift', used);
+            }
+            /* 复查：点完 600ms、面板还开着的时候读真实状态。
+               要把「已经点过但没生效」当成没点，不能光信 done 标记。 */
+            let settled = panelUp;
+            if (panelUp) {
+                if (danmakuDone.gift && !danmakuVerified.gift && !verifyOne('gift')) settled = false;
+                if (danmakuDone.lucky && !danmakuVerified.lucky && !verifyOne('lucky')) settled = false;
+            }
+            const allDone = !nGift && !nLucky;
+            if ((allDone && settled) || tries > 60) {
                 clearInterval(timer);
                 closeDanmakuPanel(icon, props);
                 danmakuBusy = false;
-                if (!done) danmakuCooldownUntil = Date.now() + 25000;
+                if (!(allDone && settled)) danmakuCooldownUntil = Date.now() + 25000;
             }
         }, 150);
     }
@@ -5356,6 +5417,7 @@
             p('icon: rect=' + box(icon) + ' | props=' + (props ? 'yes' : 'no') +
               ' | onMouseEnter=' + canHover);
             p('state: done=' + JSON.stringify(danmakuDone) +
+              ' verified=' + JSON.stringify(danmakuVerified) +
               ' busy=' + danmakuBusy + ' attempts=' + danmakuAttempts +
               ' cooldownMs=' + Math.max(0, danmakuCooldownUntil - Date.now()) +
               ' note=' + danmakuNote);
@@ -11138,7 +11200,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.49</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.50</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.52
+// @version      9.53
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -240,6 +240,11 @@
            现在 2s 轮询 + 350ms 快通道 + 网络推送事件驱动。 */
         countPollSec: 2,             // 人数轮询间隔（秒，1~30）
         enableGestures: true,
+        /* v9.53：直播间里中键 = 尽量让浏览器照常「后台新标签打开」。
+           抖音会 preventDefault 掉链接的中键，头像/昵称那种不是链接的元素更是
+           压根没有默认行为，所以这些由脚本补上（后者只能是前台标签）。
+           视频流不受这个开关影响。 */
+        liveMiddleClick: true,
         autoClosePausePopup: true,   // 监听并关闭「长时间无操作，已暂停播放」弹窗
         skipAds: true,               // 推荐流自动跳过广告视频
         skipLiveFeed: true,          // 推荐流自动跳过直播卡片
@@ -2293,6 +2298,425 @@
         if (target.closest('button, a[href], [role="button"], [role="link"]')) return false;
         return true;
     }
+    /* v9.53：直播间中键 —— 尽量交还浏览器的「后台新标签打开」。
+       实测会有两类落点，必须分开处理：
+         ① 落点在真 <a href> 里面：浏览器原生就能开，但抖音自己的处理函数会
+            preventDefault 把它取消。我们在 window 捕获阶段把事件截走，页面那段
+            代码收不到，也就没机会取消；我们自己**绝不** preventDefault，
+            浏览器的默认行为才保得住。
+         ② 落点是一层盖在卡片上的元素（卡片里有 <a href>，但不是点击目标的祖先）：
+            浏览器原生不会开（落点不在链接里），只能我们替它开。
+       诊断记录存在 lastMiddleRec 里，走「设置面板 → 诊断 → 复制中键落点诊断」取，
+       不用开控制台（抖音一开 devtools 就断网）。 */
+    let lastMiddleRec = null;
+    let middleOpenedAt = 0;
+    function middleHrefOf(a) {
+        if (!a) return null;
+        const h = (a.getAttribute('href') || '').trim();
+        if (!h || h === '#' || /^javascript:/i.test(h)) return null;
+        return h;
+    }
+    function firstHrefIn(root, limit) {
+        if (!root) return null;
+        let n = 0;
+        try {
+            for (const el of root.querySelectorAll('a[href]')) {
+                if (++n > (limit || 8)) break;
+                const h = middleHrefOf(el);
+                if (h) return h;
+            }
+        } catch (e) {}
+        return null;
+    }
+    /* 只在「头像 / 小卡片」这个尺度里找链接。
+       之前不限尺寸往上扫子树，结果中键点播放器覆盖层（1653×776）也会在深处
+       翻出主播主页链接，等于整个画面都变成「点头像」，还把切聊天室顶掉了。 */
+    function smallEnough(el, w, h) {
+        try {
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height) return false;
+            return r.width <= (w || 300) && r.height <= (h || 460);
+        } catch (e) { return false; }
+    }
+    function resolveMiddleHref(t) {
+        const own = middleHrefOf(t.closest('a[href]'));
+        if (own) return { href: own, from: 'ancestor' };
+        /* 弹层根节点单独扫一遍 —— 之前只往上 4 层，正好停在 semi-popover-content
+           外面一层，名片里的链接从来没被扫到过。层数也照旧限住。 */
+        const pop = t.closest('[class*="semi-popover"], [class*="popover"], [class*="Popover"], [role="tooltip"]');
+        if (pop && smallEnough(pop, 460, 640)) {
+            const hp = firstHrefIn(pop, 12);
+            if (hp) return { href: hp, from: 'popover' };
+        }
+        let cur = t, d = 0;
+        while (cur && d++ < 8) {
+            if (!smallEnough(cur)) break;      // 进到大块容器就停，别把整页当卡片
+            let hit = null, n = 0;
+            try {
+                for (const el of cur.querySelectorAll('a[href]')) {
+                    if (++n > 8) break;
+                    const h = middleHrefOf(el);
+                    if (h) { hit = h; break; }
+                }
+            } catch (e) {}
+            if (hit) return { href: hit, from: 'subtree+' + d };
+            cur = cur.parentElement;
+        }
+        return null;
+    }
+    /* 头像、昵称这类东西根本不是 <a>，没 href 可开；但左键点它会跳主页。
+       这里从 React 的 __reactProps$ / fiber 上把 sec_uid 掏出来自己拼地址。
+       只认 sec_uid 这种能直接拼主页的字段，不猜别的。 */
+    function reactPropsOf(el) {
+        try {
+            const k = Object.keys(el).find((x) => x.indexOf('__reactProps$') === 0);
+            return k ? el[k] : null;
+        } catch (e) { return null; }
+    }
+    function secUidIn(o) {
+        if (!o || typeof o !== 'object') return null;
+        const sid = o.sec_uid || o.secUid || o.sec_user_id || o.secUserId;
+        return (typeof sid === 'string' && /^MS4wLjAB/.test(sid)) ? sid : null;
+    }
+    /* 有限深度找 sec_uid：props 里常见的是 message.user / data.user / userInfo.user
+       这种嵌套一层的形状，之前只挑几个固定字段，全落空。 */
+    function secUidDeepIn(o, depth, tok) {
+        if (!o || typeof o !== 'object') return null;
+        let budget = 400;
+        const seen = new Set();
+        const walk = (v, d) => {
+            if (!v || typeof v !== 'object' || d > depth || budget-- <= 0) return null;
+            if (seen.has(v)) return null;
+            seen.add(v);
+            const sid = v.sec_uid || v.secUid || v.sec_user_id || v.secUserId;
+            if (typeof sid === 'string' && /^MS4wLjAB/.test(sid)) {
+                /* 有头像唯一串时，必须是同一个头像的人才算 —— 否则在播放器里
+                   随手指一个小图标，也会顺着 fiber 摸到房间的 userInfo（主播），
+                   把主播主页打开了。 */
+                if (tok) {
+                    let hit = false;
+                    for (const u of avatarUrlStrings(v)) {
+                        if (u.indexOf(tok) >= 0) { hit = true; break; }
+                    }
+                    if (!hit) return null;
+                }
+                return sid;
+            }
+            try {
+                for (const k of Object.keys(v)) {
+                    const nv = v[k];
+                    if (nv && typeof nv === 'object') {
+                        const hit = walk(nv, d + 1);
+                        if (hit) return hit;
+                    }
+                }
+            } catch (e) { return null; }
+            return null;
+        };
+        return walk(o, 0);
+    }
+    function userSecUidNear(el, tok) {
+        const pickAll = (p) => p ? (secUidDeepIn(p, 3, tok) || secUidIn(p)) : null;
+        /* ① 先看元素自己往上 4 层的 __reactProps$（最近的那层最准） */
+        let cur = el, d = 0;
+        while (cur && d++ < 4) {
+            const hit = pickAll(reactPropsOf(cur));
+            if (hit) return hit;
+            cur = cur.parentElement;
+        }
+        /* ② 再看 fiber 祖先（最多 12 层，遇到就停，不往上爬到整个直播间） */
+        let f = null;
+        try { f = dyReactFiber(el); } catch (e) {}
+        d = 0;
+        while (f && d++ < 20) {
+            const hit = pickAll(f.memoizedProps);
+            if (hit) return hit;
+            f = f.return;
+        }
+        return null;
+    }
+    /* 头像组件本身不带 sec_uid（实测 fiber 里也没有），但页面数据里一定有这个用户。
+       用头像图片地址里那段唯一串去反查：只认「同一条头像地址 + 有 sec_uid」的对象，
+       查不到就不动 —— 宁可不开，也不能开成别人。 */
+    function avatarTokenOf(src) {
+        if (!src) return null;
+        try {
+            const u = new URL(src, location.href);
+            const base = (u.pathname.split('/').pop() || '');
+            const tok = base.replace(/\.[a-z0-9]+$/i, '');
+            return tok.length >= 12 ? tok : null;
+        } catch (e) { return null; }
+    }
+    function avatarUrlStrings(o) {
+        const out = [];
+        const push = (v) => {
+            if (typeof v === 'string') out.push(v);
+            else if (v && typeof v === 'object' && Array.isArray(v.url_list)) {
+                for (const u of v.url_list) if (typeof u === 'string') out.push(u);
+            }
+        };
+        push(o.avatar_thumb); push(o.avatarThumb);
+        push(o.avatar_medium); push(o.avatar_larger);
+        push(o.avatar); push(o.avatar_url); push(o.avatarUrl);
+        return out;
+    }
+    function secUidByAvatar(src) {
+        const tok = avatarTokenOf(src);
+        if (!tok) return null;
+        let budget = 6000;
+        const seen = new Set();
+        const walk = (o, d) => {
+            if (!o || typeof o !== 'object' || d > 6 || budget <= 0) return null;
+            if (seen.has(o)) return null;
+            seen.add(o); budget--;
+            try {
+                const sid = o.sec_uid || o.secUid;
+                if (typeof sid === 'string' && /^MS4wLjAB/.test(sid)) {
+                    for (const u of avatarUrlStrings(o)) if (u.indexOf(tok) >= 0) return sid;
+                }
+                for (const k of Object.keys(o)) {
+                    const v = o[k];
+                    if (v && typeof v === 'object') {
+                        const hit = walk(v, d + 1);
+                        if (hit) return hit;
+                    }
+                }
+            } catch (e) { return null; }
+            return null;
+        };
+        for (const key of ['__STORE__', '__INLINE_PLAYER__', '__GLOBAL__', '__RENDER_DATA__']) {
+            try {
+                const hit = walk(window[key], 0);
+                if (hit) return hit;
+            } catch (e) {}
+        }
+        return null;
+    }
+    /* 聊天室观众头像不在房间数据里，但聊天列表里同一个人的头像也是 React 渲的，
+       那条消息组件的 props 里带用户信息。按头像地址找到同一个人的 DOM 节点再取。 */
+    let lastAvatarScan = null;
+    function secUidByAvatarInDom(tok) {
+        lastAvatarScan = { tok: tok || null, scanned: 0, matched: 0, found: false };
+        if (!tok) return null;
+        let n = 0;
+        try {
+            for (const img of document.querySelectorAll('img')) {
+                if (++n > 4000) break;
+                const src = img.getAttribute('src') || img.src || '';
+                if (!src || src.indexOf(tok) < 0) continue;
+                lastAvatarScan.matched++;
+                const sid = userSecUidNear(img, tok);
+                if (sid) { lastAvatarScan.found = true; return sid; }
+            }
+        } catch (e) {}
+        lastAvatarScan.scanned = n;
+        return null;
+    }
+    /* 只有「头像类」的落点才允许走用户主页那条路 —— 否则中键点画面任意空白
+       都会顺着 fiber 找到房间的 userInfo，把主播主页打开。 */
+    function isAvatarish(t) {
+        if (!(t instanceof Element)) return false;
+        if (t.tagName === 'IMG' && smallEnough(t, 160, 160)) return true;
+        if (t.closest('[class*="avatar"], [class*="Avatar"]')) return true;
+        return smallEnough(t, 120, 120);
+    }
+    function absMiddleUrl(h) {
+        try { return new URL(h, location.href).href; } catch (e) { return null; }
+    }
+    function openMiddleTab(h) {
+        const u = absMiddleUrl(h);
+        if (!u) return false;
+        try { window.open(u, '_blank', 'noopener'); } catch (e) { return false; }
+        return true;
+    }
+    /* 诊断用：沿 fiber 往上取最近两层的 props 字段名，看用户数据到底在不在 */
+    function propKeyTrace(el) {
+        const out = [];
+        let f = null;
+        try { f = dyReactFiber(el); } catch (e) {}
+        let d = 0;
+        while (f && d++ < 20 && out.length < 4) {
+            const p = f.memoizedProps;
+            if (p && typeof p === 'object') {
+                let keys = [];
+                try { keys = Object.keys(p).slice(0, 14); } catch (e) {}
+                if (keys.length) out.push('[' + d + '] ' + keys.join(','));
+            }
+            f = f.return;
+        }
+        return out;
+    }
+    function recordMiddle(t, e, res) {
+        try {
+            let popEl = null;
+            try {
+                popEl = t.closest('[class*="semi-popover"], [class*="popover"], [class*="Popover"], [role="tooltip"]');
+            } catch (e5) {}
+            let r = null;
+            try { r = t.getBoundingClientRect(); } catch (e2) {}
+            const ca = t.closest('a[href]');
+            let ar = null;
+            try {
+                const b = ca.getBoundingClientRect();
+                ar = [b.left, b.top, b.width, b.height].map((n) => Math.round(n));
+            } catch (e3) {}
+            lastMiddleRec = {
+                popText: popEl ? ((popEl.textContent || '').trim().slice(0, 140)) : null,
+                popHtml: popEl ? (popEl.outerHTML || '').slice(0, 900) : null,
+                at: new Date().toISOString(),
+                type: e.type,
+                tag: t.tagName,
+                cls: String(t.className || '').slice(0, 90),
+                e2e: (t.getAttribute && t.getAttribute('data-e2e')) || null,
+                html: (t.outerHTML || '').slice(0, 200),
+                rect: r ? [r.left, r.top, r.width, r.height].map((n) => Math.round(n)) : null,
+                anchor: ca ? { cls: String(ca.className || '').slice(0, 90),
+                    href: ca.getAttribute('href'), rect: ar } : null,
+                resolved: res ? (res.href + '  (' + res.from + ')') : null,
+                secUid: null,
+                propKeys: (() => { try { return propKeyTrace(t); } catch (e4) { return []; } })(),
+                popText: null,
+                popHtml: null,
+                chain: (() => {
+                    const out = [];
+                    let c = t, n = 0;
+                    while (c && n++ < 6) {
+                        out.push('<' + c.tagName.toLowerCase() + '> cls="' +
+                            String(c.className || '').slice(0, 40) + '"');
+                        c = c.parentElement;
+                    }
+                    return out;
+                })(),
+                opened: null,
+                prevented: null
+            };
+        } catch (e2) {}
+    }
+    function installLiveMiddleGuard() {
+        const guard = (e) => {
+            if (e.button !== 1) return;
+            if (!config.liveMiddleClick) return;      // 开关关掉 = 完全不介入
+            if (!isLivePage()) return;
+            const t = e.target;
+            if (!(t instanceof Element)) return;
+            if (t.closest(panelIgnore)) return;
+            const res = resolveMiddleHref(t);
+            if (e.type === 'mousedown' || e.type === 'pointerdown') recordMiddle(t, e, res);
+            if (!res) {
+                /* 落点不是链接（头像、昵称这类 div/img）：左键会跳主页，
+                   中键在这里浏览器没有任何默认行为可执行 —— 只能我们替它开。
+                   注意：脚本替它开只能是**前台**标签，浏览器不给后台接口。 */
+                if (e.type === 'mousedown' && isAvatarish(t)) {
+                    /* 先拿到这个头像的地址唯一串：后面每条来源都拿它做校验，
+                       「不是这个人」就一律不开 */
+                    let src = '';
+                    try {
+                        if (t.tagName === 'IMG') src = t.getAttribute('src') || t.src || '';
+                        else {
+                            const im = t.querySelector && t.querySelector('img');
+                            if (im) src = im.getAttribute('src') || im.src || '';
+                        }
+                    } catch (e3) {}
+                    const tok = avatarTokenOf(src);
+                    let sid = userSecUidNear(t, tok);
+                    let sidSrc = 'props';
+                    if (!sid) {
+                        sid = secUidByAvatar(src);
+                        sidSrc = 'avatar-src';
+                    }
+                    if (!sid) {
+                        sid = secUidByAvatarInDom(tok);
+                        sidSrc = 'avatar-src-dom';
+                    }
+                    if (sid) {
+                        if (lastMiddleRec) lastMiddleRec.secUid = sid + ' (' + sidSrc + ')';
+                        const now = Date.now();
+                        if (now - middleOpenedAt < 600) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        const u = 'https://www.douyin.com/user/' + sid;
+                        try { window.open(u, '_blank', 'noopener'); } catch (e2) {}
+                        middleOpenedAt = now;
+                        if (lastMiddleRec) lastMiddleRec.opened = 'profile ' + u;
+                        showTip('中键：已打开用户主页', 1200);
+                        return;
+                    }
+                }
+                return;                                // 也没有用户信息：不干预
+            }
+            if (res.from === 'ancestor') {
+                /* 原生能开：只挡页面取消，默认行为保留 */
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                return;
+            }
+            /* 覆盖层：原生不会开，我们替它开（一次物理点击只开一次） */
+            if (e.type !== 'mousedown') return;
+            const now = Date.now();
+            if (now - middleOpenedAt < 600) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            if (openMiddleTab(res.href)) {
+                middleOpenedAt = now;
+                if (lastMiddleRec) lastMiddleRec.opened = 'window.open ' + absMiddleUrl(res.href);
+                showTip('中键：已在新标签打开', 1200);
+            }
+        };
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'auxclick'].forEach((type) =>
+            window.addEventListener(type, guard, true));
+        /* 兜底：万一页面还是把默认行为取消了，我们自己补开一个，别让中键白点 */
+        window.addEventListener('auxclick', (e) => {
+            if (e.button !== 1 || !config.liveMiddleClick || !isLivePage()) return;
+            if (lastMiddleRec) lastMiddleRec.prevented = e.defaultPrevented;
+            if (!e.defaultPrevented) return;
+            if (Date.now() - middleOpenedAt < 600) return;
+            const res = resolveMiddleHref(e.target);
+            if (!res) return;
+            if (openMiddleTab(res.href)) {
+                middleOpenedAt = Date.now();
+                if (lastMiddleRec) lastMiddleRec.opened = 'bubble-fallback ' + absMiddleUrl(res.href);
+            }
+        }, false);
+    }
+    function dumpMiddleClick() {
+        const lines = ['# 抖音优化 · 中键落点诊断', 'URL: ' + location.href,
+            'time: ' + new Date().toISOString(), 'isLivePage: ' + isLivePage()];
+        if (!lastMiddleRec) {
+            lines.push('还没有中键记录：先在直播间里用中键点一下要看的位置，再回来点这个按钮。');
+        } else {
+            const r = lastMiddleRec;
+            lines.push('落点: <' + r.tag + '> cls="' + r.cls + '" e2e=' + r.e2e);
+            lines.push('落点 rect: ' + (r.rect ? r.rect.join(',') : '?'));
+            lines.push('落点 HTML: ' + r.html);
+            lines.push('祖先真链接: ' + (r.anchor
+                ? ('<a> cls="' + r.anchor.cls + '" href=' + r.anchor.href + ' rect=' +
+                   (r.anchor.rect ? r.anchor.rect.join(',') : '?'))
+                : '无'));
+            lines.push('祖先链: ' + (r.chain || []).join('  ←  '));
+            lines.push('解析结果: ' + (r.resolved || '落点附近没找到可用链接'));
+            lines.push('fiber 里的 sec_uid: ' + (r.secUid || '无'));
+            if (r.propKeys && r.propKeys.length) {
+                lines.push('组件 props 字段（最近的几层）:');
+                for (const k of r.propKeys) lines.push('  ' + k);
+            }
+            if (lastAvatarScan) {
+                lines.push('头像反查(DOM): 扫 ' + lastAvatarScan.scanned + ' 张图，同头像 ' +
+                    lastAvatarScan.matched + ' 处，命中 ' + (lastAvatarScan.found ? '是' : '否'));
+            }
+            if (r.popText) lines.push('弹层文本: ' + r.popText);
+            if (r.popHtml) lines.push('弹层 HTML(前 900 字): ' + r.popHtml);
+            lines.push('我们是否已打开: ' + (r.opened || '否'));
+            lines.push('页面是否取消了默认行为: ' +
+                (r.prevented === null ? '未知（事件没回到 window 顶层）' : r.prevented));
+        }
+        const text = lines.join('\n');
+        try { copyText(text); } catch (e) {}
+        try { console.log('[抖音优化] 中键落点诊断\n' + text); } catch (e) {}
+        showTip('中键落点诊断已复制，直接粘贴给我即可', 2600);
+    }
+    window.__DY_OPT_DUMP_MIDDLE__ = dumpMiddleClick;
     function handleMiddleClick(e) {
         if (!config.enableGestures) return;
         const now = Date.now();
@@ -2348,6 +2772,8 @@
     document.addEventListener('auxclick', (e) => {
         if (e.button === 1) handleMiddleClick(e);
     }, true);
+
+    installLiveMiddleGuard();
 
     document.addEventListener('mousemove', (e) => {
         if (!config.enableGestures || !isMouseDown || isLongPressing || isSwiping) return;
@@ -11224,6 +11650,7 @@
         ['detachCam',         '摄像头小窗独立浮出 (可拖动)'],
         ['pollViewerCount',   '主动轮询刷新在线人数'],
         ['enableGestures',    '鼠标手势 (长按/中键)'],
+        ['liveMiddleClick',   '直播间中键开新标签 (链接/头像)'],
         ['hideEffects',       '屏蔽礼物特效与底部礼物栏'],
         ['skipAds',           '自动跳过广告视频'],
         ['skipLiveFeed',      '自动跳过推荐直播'],
@@ -11554,7 +11981,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.52</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.53</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>
@@ -11675,6 +12102,7 @@
                     ${rowOf('pollViewerCount', sub('轮询间隔 (秒)',
                         `<input type="number" id="cfg-countPollSec" class="gm-input" value="${config.countPollSec}" min="1" max="30">`))}
                     ${rowOf('liveCenterSearch')}
+                    ${rowOf('liveMiddleClick')}
                     ${rowOf('autoClosePausePopup')}
                     <div class="gm-setting-row" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:-6px;">
                         <span style="font-size:12px;color:#aaa;">摄像头小窗选择器（留空自动识别聊天室上方那块）</span>
@@ -11739,6 +12167,10 @@
                     <div class="gm-setting-row">
                         <span>复制布局诊断 (底部空白/高度异常)</span>
                         <button type="button" id="gm-dump-layout" class="gm-btn">复制</button>
+                    </div>
+                    <div class="gm-setting-row">
+                        <span>复制中键落点诊断</span>
+                        <button type="button" id="gm-dump-middle" class="gm-btn">复制</button>
                     </div>
                     <div class="gm-hint" style="margin-top:10px;">
                         这些都是把结构化信息复制到剪贴板，贴给作者即可定位问题，不会改动任何设置。
@@ -11874,6 +12306,9 @@
 
         const layoutBtn = panel.querySelector('#gm-dump-layout');
         if (layoutBtn) layoutBtn.addEventListener('click', () => safeRun(dumpLayoutToClip));
+
+        const middleBtn = panel.querySelector('#gm-dump-middle');
+        if (middleBtn) middleBtn.addEventListener('click', () => safeRun(dumpMiddleClick));
 
         const camResetBtn = panel.querySelector('#gm-cam-reset');
         if (camResetBtn) camResetBtn.addEventListener('click', () => safeRun(camResetPos));

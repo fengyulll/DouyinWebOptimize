@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音网页版个人优化
 // @namespace    https://greasyfork.org/zh-CN/users/1662248-fengyulll
-// @version      9.51
+// @version      9.52
 // @author       fengyulll
 // @description  抖音网页版个人优化：侧栏悬浮、播放器增强、自动跳过广告/直播、直播间真实人数与消息过滤
 // @license      MIT
@@ -2282,20 +2282,25 @@
         const now = Date.now();
         if (now - lastMiddleAction < 300) return;   // mousedown / auxclick 双通道去重
         if (e.target instanceof Element && e.target.closest(panelIgnore)) return;
-        if (middleShouldPass(e.target)) return;   // 交还浏览器：中键后台开新标签
-        if (isLivePage()) {
-            /* v9.51：画面以外全部放行（以前这里是无条件切聊天室） */
-            if (!isLivePlayerSurface(e.target)) return;
+        /* v9.52：视频流不做任何放行判断，直接模拟 X 键。
+           v9.51 为了修直播间，把放行范围扩大到按钮/菜单/卡片/头像，
+           结果视频流里中键点到视频卡片、封面图、各种 data-e2e="item" 都被
+           当「有别的用途」放行掉了 —— 表现就是「视频流中键启闭评论区没用了」。
+           那套放行规则是给直播间画的，视频流这边用不上。 */
+        if (!isLivePage()) {
+            lastMiddleAction = now;
+            e.preventDefault(); e.stopImmediatePropagation();
+            tapKey('x', 'KeyX');
+            return;
         }
+        if (middleShouldPass(e.target)) return;   // 交还浏览器：中键后台开新标签
+        /* v9.51：画面以外全部放行（以前这里是无条件切聊天室） */
+        if (!isLivePlayerSurface(e.target)) return;
         lastMiddleAction = now;
         e.preventDefault(); e.stopImmediatePropagation();
-        if (isLivePage()) {
-            const btn = findChatroomToggle();
-            if (btn) fireToggleClick(btn);
-            else showTip('未找到聊天室按钮 · 可在设置里「复制聊天室顶栏 DOM」', 2800);
-        } else {
-            tapKey('x', 'KeyX');
-        }
+        const btn = findChatroomToggle();
+        if (btn) fireToggleClick(btn);
+        else showTip('未找到聊天室按钮 · 可在设置里「复制聊天室顶栏 DOM」', 2800);
     }
 
     document.addEventListener('mousedown', (e) => {
@@ -11531,7 +11536,7 @@
             </select>`;
 
         panel.innerHTML = `
-            <h3><span>抖音网页版个人优化 <small>v9.51</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
+            <h3><span>抖音网页版个人优化 <small>v9.52</small></span><span id="gm-panel-close" title="关闭">×</span></h3>
             <div class="gm-tabs" id="gm-tabs">
                 <button type="button" class="gm-tab active" data-tab="main">常用</button>
                 <button type="button" class="gm-tab" data-tab="clean">清理</button>

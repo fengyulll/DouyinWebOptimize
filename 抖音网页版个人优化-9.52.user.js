@@ -2201,13 +2201,11 @@
             播放器画面/覆盖层的圆角是 0，不会误伤；
          ② **fiber 上带用户身份** —— userId / sec_uid / nickname 这类字段。
        命中任意一条就当成「这里有自己的用途」，放行给浏览器。 */
-    function looksLikeUserChip(el) {
+    function looksLikeUserChip(el, roundOnly) {
         let cur = el, d = 0;
         while (cur && d++ < 5) {
             if (!(cur instanceof Element)) break;
             const r = cur.getBoundingClientRect();
-            /* 头像常常就是一张 <img>，圆角在父级身上 */
-            if (cur.tagName === 'IMG' && r.width >= 20 && r.width <= 100) return true;
             if (r.width >= 20 && r.width <= 100 && Math.abs(r.width - r.height) <= 6) {
                 let br = '';
                 try { br = window.getComputedStyle(cur).borderRadius || ''; } catch (e) {}
@@ -2216,6 +2214,10 @@
             }
             cur = cur.parentElement;
         }
+        /* roundOnly：只要「圆不圆」这一个结论（视频流用）。
+           视频卡片的组件树上也可能挂着 author.userId，走 fiber 判断会把卡片
+           一起放行，评论区又切不了 —— 所以视频流不查 fiber。 */
+        if (roundOnly) return false;
         let f = null;
         try { f = dyReactFiber(el); } catch (e) {}
         let k = 0;
@@ -2228,6 +2230,20 @@
             f = f.return;
         }
         return false;
+    }
+    /* 视频流的放行要**窄**：整包跳过放行判断会让中键点头像、昵称也不跳转
+       （它们本来能后台开新标签）。
+       但不能把直播间那套整包搬过来 —— `[data-e2e*="item"]`、`[class*="card"]`、
+       「祖先有 title/aria-label」这些会把视频卡片也放行，评论区又切不了。
+       所以视频流只认这三类：用户主页链接、用户特征属性、圆形头像。 */
+    const VIDEO_USER_SEL = 'a[href*="/user/"], a[href*="/profile/"], ' +
+        '[data-e2e*="avatar"], [data-e2e*="user"], [data-e2e*="author"], ' +
+        '[data-e2e*="nickname"], [data-e2e*="account"], ' +
+        '[class*="avatar"], [class*="Avatar"], [class*="nickname"], [class*="Nickname"]';
+    function videoMiddleShouldPass(target) {
+        if (!(target instanceof Element)) return false;
+        if (target.closest(VIDEO_USER_SEL)) return true;
+        return looksLikeUserChip(target, true);   // 只认圆形小块，不查 fiber
     }
     function middleShouldPass(target) {
         if (!(target instanceof Element)) return false;
@@ -2288,6 +2304,8 @@
            当「有别的用途」放行掉了 —— 表现就是「视频流中键启闭评论区没用了」。
            那套放行规则是给直播间画的，视频流这边用不上。 */
         if (!isLivePage()) {
+            /* 头像 / 昵称 / 用户主页链接：交还浏览器，中键后台开新标签 */
+            if (videoMiddleShouldPass(e.target)) return;
             lastMiddleAction = now;
             e.preventDefault(); e.stopImmediatePropagation();
             tapKey('x', 'KeyX');
